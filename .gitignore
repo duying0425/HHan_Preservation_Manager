@@ -1,0 +1,21 @@
+# 敏感认证凭据
+config.json
+
+# 运行日志与缓存数据
+logs/
+*.log
+hhan_active_preservation.json
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# IDE 与操作系统临时文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

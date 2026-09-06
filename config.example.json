@@ -1,0 +1,16 @@
+{
+  "hhan_base_url": "https://hhanclub.net",
+  "hhan_cookie": "c_secure_login=YOUR_LOGIN_COOKIE; c_secure_pass=YOUR_PASS_COOKIE; c_secure_ssl=eWVhaA%3D%3D; c_secure_tracker_ssl=eWVhaA%3D%3D; c_secure_uid=YOUR_UID",
+  "hhan_passkey": "YOUR_HHAN_PASSKEY",
+  "hhan_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "user_id": "YOUR_USER_ID",
+  "qb_base_url": "http://127.0.0.1:8080",
+  "qb_cookie": "SID=YOUR_QB_SID_COOKIE",
+  "category_keep": "保种",
+  "category_del": "待删除",
+  "max_preservation_space_gb": 4096.0,
+  "max_candidate_seeders": 3,
+  "min_candidate_seeders": 1,
+  "max_single_download_gb": 80.0,
+  "max_batch_download_gb": 200.0
+}
