@@ -1,6 +1,6 @@
 # HHanClub 保种区自动化综合管理工具包
 
-V3：在固定 **保种专项配额** 下，将当前保种任务与新候选统一进行组合优化；同时引入持续更新的保种账本，避免历史快照覆盖最新状态。
+V4：在固定 **保种专项配额** 下，将当前保种任务与新候选统一进行组合优化；同时使用持续更新的保种账本，自动维护当前状态。
 
 ## 主要更新
 
@@ -9,6 +9,7 @@ V3：在固定 **保种专项配额** 下，将当前保种任务与新候选统
 - `user_preservation_cache.json` 作为唯一运行时主账本；
 - 每次运行自动与 qBittorrent 当前 HHan 任务对账；
 - 手动将“待删除”任务恢复为“保种”后，会自动重新进入组合优化；
+- 如果缓存文件不存在，会自动通过 HHan action=7 + 当前 qBittorrent 状态重建；
 - 支持独立缓存刷新任务，不下载、不修改分类。
 
 ## 文件
@@ -22,8 +23,7 @@ V3：在固定 **保种专项配额** 下，将当前保种任务与新候选统
 
 运行数据：
 
-- `user_preservation_cache.json`：主账本（不提交 Git）
-- `hhan_active_preservation.json`：旧版本历史文件，仅首次迁移使用
+- `user_preservation_cache.json`：唯一主账本（不提交 Git）
 
 ## 缓存账本机制
 
@@ -31,8 +31,6 @@ V3：在固定 **保种专项配额** 下，将当前保种任务与新候选统
 
 ```text
 user_preservation_cache.json
-        ↓
-首次运行迁移旧 hhan_active_preservation.json
         ↓
 检查 HHan action=7 远端数据是否超过刷新周期
         ↓
@@ -45,11 +43,23 @@ user_preservation_cache.json
 执行组合优化
 ```
 
-这样可以支持：
+如果不存在缓存：
+
+```text
+首次启动
+    ↓
+强制刷新 HHan action=7
+    ↓
+读取 qB 当前任务
+    ↓
+自动生成 user_preservation_cache.json
+```
+
+支持：
 
 - 手动恢复“待删除”任务；
 - qB 任务状态变化自动同步；
-- 不依赖几天前生成的静态 JSON。
+- 不依赖旧历史快照文件。
 
 ## 单独刷新缓存
 
