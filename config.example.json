@@ -16,5 +16,6 @@
   "max_batch_download_count": 10,
   "portfolio_unit_gb": 0.1,
   "protect_init_one": true,
-  "protect_unknown_records": true
+  "protect_unknown_records": true,
+  "cache_remote_refresh_hours": 24.0
 }
