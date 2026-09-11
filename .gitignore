@@ -1,20 +1,22 @@
-# 敏感认证凭据
+# 敏感认证
 config.json
 
-# 运行日志与缓存数据
+# 日志和缓存
 logs/
 *.log
 hhan_active_preservation.json
+user_preservation_cache.json
+preservation_torrents_ranked.csv
 
-# Python 缓存
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
 .venv/
 venv/
 ENV/
 
-# IDE 与操作系统临时文件
+# IDE
 .idea/
 .vscode/
 .DS_Store
