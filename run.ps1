@@ -1,107 +1,74 @@
-# HHanClub 保种区自动化运行脚本
+$ErrorActionPreference = 'Stop'
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
+$ManagerScript = Join-Path $ScriptDir 'hhan_pzone_manager.py'
 
-$ErrorActionPreference = "Stop"
-$ManagerScript = Join-Path $ScriptDir "hhan_pzone_manager.py"
-
-if (-not (Test-Path $ManagerScript)) {
-    Write-Error "Manager script not found: $ManagerScript"
+if (-not (Test-Path -LiteralPath $ManagerScript)) {
+    Write-Host ('[ERROR] Manager script not found: ' + $ManagerScript)
     exit 2
 }
 
-function Test-PythonCandidate {
+function Try-Python3 {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Executable,
-        [string[]]$PrefixArgs = @()
+        [string]$Exe,
+        [string[]]$Prefix = @()
     )
 
     try {
-        & $Executable @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" *> $null
-        return ($LASTEXITCODE -eq 0)
+        & $Exe @Prefix -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' > $null 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
     }
     catch {
         return $false
     }
-}
 
-$Candidates = @()
-
-# 1) Python Launcher. py.exe 可能存在但没有有效 Python 注册，因此必须实际探测。
-$PyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
-if ($PyLauncher) {
-    $Candidates += [PSCustomObject]@{
-        Exe = $PyLauncher.Source
-        Prefix = @("-3")
-        Label = "py -3"
+    $PrefixText = $Prefix -join ' '
+    if ($PrefixText) {
+        Write-Host ('[INFO] Python: ' + $Exe + ' ' + $PrefixText)
     }
-}
-
-# 2) PATH 中的 python/python3。WindowsApps 的占位别名会在实际探测时自动被排除。
-foreach ($CommandName in @("python.exe", "python3.exe", "python")) {
-    $Cmd = Get-Command $CommandName -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($Cmd) {
-        $Candidates += [PSCustomObject]@{
-            Exe = $Cmd.Source
-            Prefix = @()
-            Label = $CommandName
-        }
+    else {
+        Write-Host ('[INFO] Python: ' + $Exe)
     }
+
+    & $Exe @Prefix $ManagerScript --execute
+    $Code = $LASTEXITCODE
+    if ($null -eq $Code) {
+        $Code = 1
+    }
+    exit $Code
 }
 
-# 3) 常见用户级 Python 安装目录兜底，不写死用户名和 Python 版本。
-$SearchPatterns = @(
-    (Join-Path $env:LOCALAPPDATA "Python\pythoncore-*\python.exe"),
-    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python*\python.exe")
+$CommandCandidates = @(
+    @{ Name = 'py.exe'; Prefix = @('-3') },
+    @{ Name = 'python.exe'; Prefix = @() },
+    @{ Name = 'python3.exe'; Prefix = @() }
 )
-foreach ($Pattern in $SearchPatterns) {
-    Get-ChildItem -Path $Pattern -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object {
-        $Candidates += [PSCustomObject]@{
-            Exe = $_.FullName
-            Prefix = @()
-            Label = $_.FullName
-        }
+
+foreach ($Item in $CommandCandidates) {
+    $Cmd = Get-Command $Item.Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Cmd) {
+        Try-Python3 -Exe $Cmd.Source -Prefix $Item.Prefix | Out-Null
     }
 }
 
-# 去重后逐个进行真实 Python 3 探测。
-$Seen = @{}
-$Selected = $null
-foreach ($Candidate in $Candidates) {
-    $Key = $Candidate.Exe + "|" + ($Candidate.Prefix -join " ")
-    if ($Seen.ContainsKey($Key)) {
-        continue
-    }
-    $Seen[$Key] = $true
+$LocalPatterns = @(
+    (Join-Path $env:LOCALAPPDATA 'Python\pythoncore-*\python.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python*\python.exe')
+)
 
-    if (Test-PythonCandidate -Executable $Candidate.Exe -PrefixArgs $Candidate.Prefix) {
-        $Selected = $Candidate
-        break
+foreach ($Pattern in $LocalPatterns) {
+    $Matches = Get-ChildItem -Path $Pattern -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending
+    foreach ($Match in $Matches) {
+        Try-Python3 -Exe $Match.FullName | Out-Null
     }
 }
 
-if (-not $Selected) {
-    Write-Host "[ERROR] 未找到可用的 Python 3。" -ForegroundColor Red
-    Write-Host "请在 PowerShell 中执行以下命令检查：" -ForegroundColor Yellow
-    Write-Host "  py -3 --version"
-    Write-Host "  python --version"
-    exit 127
-}
-
-Write-Host ("[INFO] 使用 Python: {0} {1}" -f $Selected.Exe, ($Selected.Prefix -join " ")) -ForegroundColor Cyan
-
-try {
-    & $Selected.Exe @($Selected.Prefix) $ManagerScript --execute
-    $ExitCode = $LASTEXITCODE
-}
-catch {
-    Write-Error $_
-    exit 1
-}
-
-if ($null -eq $ExitCode) {
-    $ExitCode = 1
-}
-
-exit $ExitCode
+Write-Host '[ERROR] No usable Python 3 installation was found.'
+Write-Host 'Try these commands in PowerShell:'
+Write-Host '  py -3 --version'
+Write-Host '  python --version'
+exit 127
