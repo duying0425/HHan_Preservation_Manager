@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """HHanClub preservation-zone automation manager.
 
-V3 cache model:
-- user_preservation_cache.json is the only active ledger.
+V4 cache model:
+- user_preservation_cache.json is the only persistent ledger.
 - Every run reconciles the ledger against current qBittorrent HHan tasks.
-- Remote HHan preservation history is refreshed automatically when stale.
-- hhan_active_preservation.json is treated only as a one-time legacy migration source.
-- Current preservation tasks and new candidates use the same value model and a 0/1 knapsack.
+- Remote HHan action=7 history is refreshed automatically when stale.
+- If the cache file is missing, it is rebuilt automatically from action=7 + qB.
+- Current preservation torrents and new candidates use the same value model and a 0/1 knapsack.
 """
 
 import argparse
@@ -37,8 +37,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(BASE_DIR, "user_preservation_cache.json")
-LEGACY_ACTIVE_PATH = os.path.join(BASE_DIR, "hhan_active_preservation.json")
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 CONFIG = {
     "hhan_base_url": "https://hhanclub.net",
@@ -248,7 +247,6 @@ def empty_cache():
         "version": CACHE_VERSION,
         "updated_at": None,
         "remote_updated_at": None,
-        "legacy_migrated_at": None,
         "records": [],
     }
 
@@ -265,6 +263,9 @@ def load_cache():
         payload.update(data if isinstance(data, dict) else {})
         payload["version"] = CACHE_VERSION
         payload.setdefault("records", [])
+        # V3 legacy-migration metadata is obsolete in V4.
+        payload.pop("legacy_migrated_at", None)
+        payload.pop("legacy_source_updated_at", None)
         return payload
     except Exception as exc:
         raise RuntimeError(f"读取 user_preservation_cache.json 失败: {exc}") from exc
@@ -273,6 +274,8 @@ def load_cache():
 def save_cache(payload):
     payload["version"] = CACHE_VERSION
     payload["updated_at"] = iso_now()
+    payload.pop("legacy_migrated_at", None)
+    payload.pop("legacy_source_updated_at", None)
     tmp_path = CACHE_PATH + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -370,29 +373,6 @@ def merge_record(records, source_record, source_name):
     return record
 
 
-def migrate_legacy_active(payload):
-    """One-time import from hhan_active_preservation.json into the canonical cache."""
-    if payload.get("legacy_migrated_at") or not os.path.exists(LEGACY_ACTIVE_PATH):
-        return 0
-    try:
-        with open(LEGACY_ACTIVE_PATH, "r", encoding="utf-8") as f:
-            legacy = json.load(f)
-        legacy_records = legacy.get("records", []) if isinstance(legacy, dict) else []
-    except Exception as exc:
-        print(f"[缓存] 旧 active 文件读取失败，跳过迁移: {exc}")
-        return 0
-
-    records = payload.setdefault("records", [])
-    before = len(records)
-    for item in legacy_records:
-        merge_record(records, item, "legacy_active")
-    payload["legacy_migrated_at"] = iso_now()
-    payload["legacy_source_updated_at"] = legacy.get("updated_at") if isinstance(legacy, dict) else None
-    imported = max(0, len(records) - before)
-    print(f"[缓存] 已迁移旧 hhan_active_preservation.json：{len(legacy_records)} 条，新增 {imported} 条。")
-    return imported
-
-
 def remote_refresh_due(payload, force=False):
     if force:
         return True
@@ -471,10 +451,12 @@ def merge_remote_into_cache(payload, remote_records):
 
 
 def reconcile_cache_with_qb(payload, qb_torrents):
-    """Reconcile the ledger with current qB state on every run.
+    """Reconcile ledger with qB on every run.
 
-    Moving a torrent from 待删除 back to 保种 makes active=True on the next run,
-    so the restored task re-enters the global portfolio.
+    A task manually moved from 待删除 back to 保种 becomes active on the next run
+    and therefore re-enters the global portfolio. Tasks that exist in qB but do
+    not have action=7 metadata remain unknown and are protected when
+    protect_unknown_records=true.
     """
     records = payload.setdefault("records", [])
     now = iso_now()
@@ -551,33 +533,42 @@ def reconcile_cache_with_qb(payload, qb_torrents):
 
 
 def refresh_cache(session, force_remote=False, quiet=False):
+    cache_missing = not os.path.exists(CACHE_PATH)
     payload = load_cache()
-    migrate_legacy_active(payload)
 
+    if cache_missing and not quiet:
+        print("[缓存] 未检测到 user_preservation_cache.json，将从 action=7 + 当前 qB 自动重建。")
+
+    # Missing cache always forces a fresh action=7 fetch; no legacy file is read.
+    should_refresh_remote = remote_refresh_due(payload, force=(force_remote or cache_missing))
     remote_refreshed = False
-    if remote_refresh_due(payload, force=force_remote):
+    if should_refresh_remote:
         remote_records = fetch_remote_preservation_records()
         if remote_records:
             merge_remote_into_cache(payload, remote_records)
             remote_refreshed = True
+        elif cache_missing:
+            print("[缓存] ⚠️ action=7 未取得记录，将仅根据当前 qB 建账；未知任务会按保护策略处理。")
         elif force_remote:
             print("[缓存] 强制远端刷新未取得记录，保留现有账本。")
 
     qb_torrents = qb_all_torrents(session)
     stats = reconcile_cache_with_qb(payload, qb_torrents)
     save_cache(payload)
+    stats["cache_rebuilt"] = cache_missing
     stats["remote_refreshed"] = remote_refreshed
     stats["remote_updated_at"] = payload.get("remote_updated_at")
 
     if not quiet:
+        action = "重建完成" if cache_missing else "对账完成"
         print(
-            f"[缓存] 对账完成：账本 {stats['cache_records']} 条，"
+            f"[缓存] {action}：账本 {stats['cache_records']} 条，"
             f"qB 中 HHan {stats['hhan_in_qb']} 个，当前【{CONFIG['category_keep']}】 {stats['active_keep']} 个"
         )
         if stats["restored"]:
             print(f"      检测到 {stats['restored']} 个任务重新回到【{CONFIG['category_keep']}】，已恢复为 active。")
         if stats["unknown"]:
-            print(f"      新发现 {stats['unknown']} 个无历史元数据任务，暂按未知记录保护。")
+            print(f"      新发现 {stats['unknown']} 个无 action=7 元数据任务，暂按未知记录保护。")
     return payload, qb_torrents, stats
 
 
@@ -606,7 +597,10 @@ def check_qb_status(qb_torrents, cache_payload):
             size_gb=size_gb,
         )
         init_n = safe_int(record.get("init_seeders")) if record else 0
-        curr_n = safe_int(record.get("curr_seeders"), 1) if record else max(1, safe_int(torrent.get("num_complete"), 1))
+        curr_n = (
+            safe_int(record.get("curr_seeders"), 1)
+            if record else max(1, safe_int(torrent.get("num_complete"), 1))
+        )
         age_weeks = safe_float(record.get("age_weeks"), 16.0) if record else 16.0
 
         if init_n <= 0:
@@ -618,7 +612,7 @@ def check_qb_status(qb_torrents, cache_payload):
             protect_reason = "初始1人硬保护"
         elif CONFIG.get("protect_unknown_records", True) and init_n <= 0:
             protected = True
-            protect_reason = "历史元数据未知"
+            protect_reason = "action=7元数据未知"
 
         metrics = calc_preservation_metrics(size_gb, age_weeks, curr_n, init_n)
         items.append({
@@ -740,7 +734,9 @@ def fetch_rescue_candidates(existing_names):
             "portfolio_value": round(metrics["portfolio_value"], 6),
         })
 
-    candidates.sort(key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True)
+    candidates.sort(
+        key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True
+    )
     stats["eligible_count"] = len(candidates)
     print(f"      扫描 {pages} 页，保种区 {len(cards)} 个；合格候选 {len(candidates)} 个")
     return candidates, stats
@@ -836,9 +832,13 @@ def generate_strategy(candidates, current_keep_gb, current_items):
     target_keys = {item["key"] for item in target}
     target_new = [item for item in selected_optional if item["source"] == "new"]
     target_existing = [item for item in target if item["source"] == "existing"]
-    excluded_existing = [item for item in optional_existing if item["key"] not in target_keys]
+    excluded_existing = [
+        item for item in optional_existing if item["key"] not in target_keys
+    ]
 
-    target_new.sort(key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True)
+    target_new.sort(
+        key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True
+    )
     batch_gb = safe_float(CONFIG.get("max_batch_download_gb"), 200.0)
     batch_count = safe_int(CONFIG.get("max_batch_download_count"), 10)
     selected_batch, download_gb = [], 0.0
@@ -888,8 +888,18 @@ def generate_strategy(candidates, current_keep_gb, current_items):
     return to_download, download_gb, to_mark_delete, marked_gb, projected, stats
 
 
-def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, current_keep_gb,
-                          zone_stats, portfolio_stats, unmatched_count, cache_stats, dry_run):
+def print_strategy_report(
+    to_download,
+    download_gb,
+    to_mark_delete,
+    marked_gb,
+    current_keep_gb,
+    zone_stats,
+    portfolio_stats,
+    unmatched_count,
+    cache_stats,
+    dry_run,
+):
     max_space = safe_float(CONFIG["max_preservation_space_gb"])
     mode = "DRY-RUN" if dry_run else "EXECUTE"
     print("\n" + "=" * 96)
@@ -897,6 +907,7 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
     print("=" * 96)
     print(
         f"缓存: {cache_stats['cache_records']} 条 | 当前保种 {cache_stats['active_keep']} | "
+        f"{'本轮自动重建 | ' if cache_stats.get('cache_rebuilt') else ''}"
         f"远端刷新 {'是' if cache_stats['remote_refreshed'] else '否'} | "
         f"remote_updated_at={cache_stats.get('remote_updated_at') or '-'}"
     )
@@ -905,7 +916,10 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
         f"0人 {zone_stats['dead_count']} | 超人数阈值 {zone_stats['crowded_count']} | "
         f"超体积阈值 {zone_stats['huge_count']} | 候选 {zone_stats['eligible_count']}"
     )
-    print(f"当前【{CONFIG['category_keep']}】专项配额: {current_keep_gb:.2f} / {max_space:.2f} GB ({current_keep_gb / 1024.0:.2f} TB)")
+    print(
+        f"当前【{CONFIG['category_keep']}】专项配额: {current_keep_gb:.2f} / "
+        f"{max_space:.2f} GB ({current_keep_gb / 1024.0:.2f} TB)"
+    )
     print(
         f"全局目标组合: {portfolio_stats['target_count']} 个 / {portfolio_stats['target_space_gb']:.2f} GB | "
         f"预测价值 {portfolio_stats['current_value']:.2f} -> {portfolio_stats['target_value']:.2f} "
@@ -913,7 +927,7 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
     )
     print(
         f"硬保护: {portfolio_stats['protected_count']} 个 / {portfolio_stats['protected_gb']:.2f} GB | "
-        f"元数据未知: {unmatched_count} 个"
+        f"action=7元数据未知: {unmatched_count} 个"
     )
 
     print(f"\n[+] 本轮新增: {len(to_download)} 个 / {download_gb:.2f} GB")
@@ -923,7 +937,10 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
             f"价值/GB {item['value_per_gb']:.3f} | {item['title']}"
         )
 
-    print(f"\n[-] 本轮退出【{CONFIG['category_keep']}】: {len(to_mark_delete)} 个 / {marked_gb:.2f} GB")
+    print(
+        f"\n[-] 本轮退出【{CONFIG['category_keep']}】: "
+        f"{len(to_mark_delete)} 个 / {marked_gb:.2f} GB"
+    )
     for idx, item in enumerate(to_mark_delete, 1):
         print(
             f"  {idx:>2}. {item['size_gb']:>7.2f} GB | init={item['init_seeders']} curr={item['curr_seeders']} | "
@@ -933,7 +950,10 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
     final_estimate = current_keep_gb + download_gb - marked_gb
     print(f"\n本轮执行后预计专项配额: {final_estimate:.2f} GB / {max_space:.2f} GB")
     if portfolio_stats["unresolved_overflow_gb"] > 0.01:
-        print(f"⚠️ 仍有 {portfolio_stats['unresolved_overflow_gb']:.2f} GB 无法释放，请检查硬保护项和未知元数据。")
+        print(
+            f"⚠️ 仍有 {portfolio_stats['unresolved_overflow_gb']:.2f} GB "
+            "无法释放，请检查硬保护项和未知元数据。"
+        )
     print(f"背包离散粒度: {portfolio_stats['unit_gb']:.2f} GB")
     print("=" * 96 + "\n")
 
@@ -945,7 +965,12 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb, c
 def upsert_candidate_cache(candidate):
     payload = load_cache()
     records = payload.setdefault("records", [])
-    record = find_cache_record(records, torrent_id=candidate["id"], title=candidate["title"], size_gb=candidate["size_gb"])
+    record = find_cache_record(
+        records,
+        torrent_id=candidate["id"],
+        title=candidate["title"],
+        size_gb=candidate["size_gb"],
+    )
     if record is None:
         record = {}
         records.append(record)
@@ -987,21 +1012,39 @@ def execute_actions(session, to_download, to_mark_delete):
         if not torrent_bytes or len(torrent_bytes) < 100:
             print(f"      ❌ #{candidate['id']} 种子文件下载失败")
             continue
-        files = {"torrents": (f"{candidate['id']}.torrent", torrent_bytes, "application/x-bittorrent")}
-        data = {"category": CONFIG["category_keep"], "autoTMM": "true", "paused": "false"}
-        response = session.post(f"{base}/api/v2/torrents/add", files=files, data=data, timeout=30)
+        files = {
+            "torrents": (
+                f"{candidate['id']}.torrent",
+                torrent_bytes,
+                "application/x-bittorrent",
+            )
+        }
+        data = {
+            "category": CONFIG["category_keep"],
+            "autoTMM": "true",
+            "paused": "false",
+        }
+        response = session.post(
+            f"{base}/api/v2/torrents/add", files=files, data=data, timeout=30
+        )
         if response.status_code == 200 and "fails" not in response.text.lower():
             added += 1
             upsert_candidate_cache(candidate)
             print(f"      ✅ 已加入 #{candidate['id']} {candidate['title'][:55]}")
         else:
-            print(f"      ❌ #{candidate['id']} 加入 qB 失败: HTTP {response.status_code} {response.text.strip()}")
+            print(
+                f"      ❌ #{candidate['id']} 加入 qB 失败: "
+                f"HTTP {response.status_code} {response.text.strip()}"
+            )
         time.sleep(0.5)
 
     marked = 0
     if to_mark_delete:
         try:
-            required_free = max(0.0, current_keep_gb(session) - safe_float(CONFIG["max_preservation_space_gb"]))
+            required_free = max(
+                0.0,
+                current_keep_gb(session) - safe_float(CONFIG["max_preservation_space_gb"]),
+            )
         except Exception as exc:
             print(f"      ⚠️ 无法复核 qB 配额，跳过退出旧任务: {exc}")
             required_free = 0.0
@@ -1022,7 +1065,10 @@ def execute_actions(session, to_download, to_mark_delete):
             )
             if response.status_code == 200:
                 marked = len(selected)
-                print(f"      ✅ {marked} 个旧任务转为【{CONFIG['category_del']}】，退出专项配额约 {selected_gb:.2f} GB")
+                print(
+                    f"      ✅ {marked} 个旧任务转为【{CONFIG['category_del']}】，"
+                    f"退出专项配额约 {selected_gb:.2f} GB"
+                )
             else:
                 print(f"      ❌ 分类变更失败: HTTP {response.status_code}")
 
@@ -1035,20 +1081,26 @@ def execute_actions(session, to_download, to_mark_delete):
 
 def main():
     parser = argparse.ArgumentParser(description="HHanClub 保种区自动化综合管理")
-    parser.add_argument("--execute", action="store_true", help="实际执行下载和分类变更；默认仅 dry-run")
+    parser.add_argument(
+        "--execute", action="store_true", help="实际执行下载和分类变更；默认仅 dry-run"
+    )
     parser.add_argument(
         "--refresh-cache",
         action="store_true",
-        help="强制刷新 HHan 远端档案并与 qB 对账，只更新缓存后退出",
+        help="强制刷新 HHan action=7 并与 qB 对账，只更新缓存后退出",
     )
-    parser.add_argument("--sync", action="store_true", help="兼容旧参数：等同 --refresh-cache")
+    parser.add_argument(
+        "--sync", action="store_true", help="兼容旧参数：等同 --refresh-cache"
+    )
     args = parser.parse_args()
 
     load_config()
     session = get_qb_session()
 
     cache_only = bool(args.refresh_cache or args.sync)
-    cache_payload, qb_torrents, cache_stats = refresh_cache(session, force_remote=cache_only)
+    cache_payload, qb_torrents, cache_stats = refresh_cache(
+        session, force_remote=cache_only
+    )
     if cache_only:
         print(
             f"缓存刷新完成：{cache_stats['cache_records']} 条；"
@@ -1057,16 +1109,31 @@ def main():
         )
         return
 
-    existing_names, keep_gb, current_items, unmatched = check_qb_status(qb_torrents, cache_payload)
-    candidates, zone_stats = fetch_rescue_candidates(existing_names)
-    to_download, download_gb, to_mark_delete, marked_gb, _projected, portfolio_stats = generate_strategy(
-        candidates, keep_gb, current_items
+    existing_names, keep_gb, current_items, unmatched = check_qb_status(
+        qb_torrents, cache_payload
     )
+    candidates, zone_stats = fetch_rescue_candidates(existing_names)
+    (
+        to_download,
+        download_gb,
+        to_mark_delete,
+        marked_gb,
+        _projected,
+        portfolio_stats,
+    ) = generate_strategy(candidates, keep_gb, current_items)
 
     dry_run = not args.execute
     print_strategy_report(
-        to_download, download_gb, to_mark_delete, marked_gb, keep_gb,
-        zone_stats, portfolio_stats, unmatched, cache_stats, dry_run
+        to_download,
+        download_gb,
+        to_mark_delete,
+        marked_gb,
+        keep_gb,
+        zone_stats,
+        portfolio_stats,
+        unmatched,
+        cache_stats,
+        dry_run,
     )
 
     if args.execute:
