@@ -1,33 +1,43 @@
 #!/bin/bash
-# ==============================================================================
-# HHanClub 保种区自动化综合管理运行脚本 (run.sh for Linux / Synology NAS)
-# ==============================================================================
+set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
 
-# 优先使用用户目录或系统安装的 python3
 PYTHON_BIN="/usr/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(which python3 || which python)"
+    PYTHON_BIN="$(command -v python3 || command -v python || true)"
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "Python 3 not found" >&2
+    exit 127
 fi
 
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/manager.log"
 
-TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-echo "================================================================================" >> "$LOG_FILE"
-echo "[$TIMESTAMP] 开始执行 HHanClub 保种区自动化综合管理流水线" >> "$LOG_FILE"
-echo "================================================================================" >> "$LOG_FILE"
+if [ "$#" -eq 0 ]; then
+    set -- --execute
+fi
 
-"$PYTHON_BIN" "$SCRIPT_DIR/hhan_pzone_manager.py" --execute >> "$LOG_FILE" 2>&1
+TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+{
+    echo "================================================================================"
+    echo "[$TIMESTAMP] 开始执行 HHanClub 保种区自动化综合管理流水线: $*"
+    echo "================================================================================"
+} >> "$LOG_FILE"
+
+"$PYTHON_BIN" "$SCRIPT_DIR/hhan_pzone_manager.py" "$@" >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 END_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-echo "================================================================================" >> "$LOG_FILE"
-echo "[$END_TIMESTAMP] 执行完成，退出状态码: $EXIT_CODE" >> "$LOG_FILE"
-echo "================================================================================" >> "$LOG_FILE"
-echo "" >> "$LOG_FILE"
+{
+    echo "================================================================================"
+    echo "[$END_TIMESTAMP] 执行完成，退出状态码: $EXIT_CODE"
+    echo "================================================================================"
+    echo ""
+} >> "$LOG_FILE"
 
 exit $EXIT_CODE
