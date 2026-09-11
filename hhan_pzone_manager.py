@@ -1,101 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-=============================================================================
-HHanClub ä¿ç§åŒºè‡ªåŠ¨åŒ–ç»¼åˆç®¡ç†æµæ°´çº¿è„šæœ¬ (hhan_pzone_manager.py)
-=============================================================================
-æ ¸å¿ƒç­–ç•¥åŸåˆ™ï¼š
- 1. ã€å®ç¼ºæ¯‹æ»¥ï¼Œæ‹’ç»å¹³åº¸ã€‘ï¼š
-    - ç»ä¸ä¸‹è½½ 0 äººæ­»ç§ï¼ˆæ— åšç§æºï¼Œæ— æ³•å®Œæˆä¸‹è½½ï¼Œ7å¤©ä¼šè¢«ç³»ç»Ÿæƒ©ç½šå–æ¶ˆåé¢ï¼‰ï¼›
-    - è¶…è¿‡ max_candidate_seeders çš„ç§å­ä¸è¿›å…¥æ–°å¢å€™é€‰æ± ï¼ˆé»˜è®¤é˜ˆå€¼ä¸º 3ï¼Œå¯åœ¨ config.json è°ƒæ•´ï¼‰ï¼›
-    - å€™é€‰äººæ•°èŒƒå›´ç”± config.json çš„ min_candidate_seeders / max_candidate_seeders æ§åˆ¶ï¼ˆé»˜è®¤ 1~3 äººï¼‰ã€‚
- 2. ã€4TB ä¿ç§ä¸“é¡¹é…é¢ç®¡ç†ã€‘ï¼š
-    - è®¾å®šã€ä¿ç§ã€‘åˆ†ç±»ä¸“é¡¹é…é¢ä¸º 4.0 TB (4,096 GB)ï¼›
-    - å½“å‰å ç”¨ < 4TB ä¸”æ— æå“æ–°ç§æ—¶ï¼šé™é»˜å®ˆæŠ¤ï¼Œä¸ä¸‹è½½ã€ä¸åˆ é™¤ï¼›
-    - å½“å‰å ç”¨ < 4TB ä¸”æœ‰æå“æ–°ç§æ—¶ï¼šç›´æ¥ä¸‹è½½å¸çº³ï¼Œæ— éœ€æ·˜æ±°è€ç§ï¼›
-    - å°†å½“å‰ä¿ç§ä»»åŠ¡ä¸æ–°å€™é€‰ç»Ÿä¸€çº³å…¥ 0/1 èƒŒåŒ…ä¼˜åŒ–ï¼Œåœ¨ 4TB ä¸“é¡¹é…é¢å†…é€‰æ‹©ç»„åˆä»·å€¼æœ€é«˜çš„ç›®æ ‡é›†åˆï¼›æŒ‰å•æ‰¹ä¸Šé™é€è½®æ”¶æ•›ã€‚
-=============================================================================
+"""HHanClub preservation-zone automation manager.
+
+Design goals:
+- Treat max_preservation_space_gb as a dedicated qBittorrent category quota, not total disk usage.
+- Reuse existing preservation history JSON/cache data.
+- Evaluate current preservation torrents and new candidates with one value model.
+- Use a 0/1 knapsack to select the highest-value portfolio under the quota.
+- Converge toward that target gradually using per-run download limits.
 """
 
-import sys
-import os
-import re
+import argparse
 import json
 import math
-import time
-import argparse
-import subprocess
+import os
+import re
 import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from http.cookies import SimpleCookie
-from bs4 import BeautifulSoup
+
 import requests
 import urllib3
+from bs4 import BeautifulSoup
 
-if sys.stdout.encoding != 'utf-8':
+
+if getattr(sys.stdout, "encoding", "") and sys.stdout.encoding.lower() != "utf-8":
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==================== è®¤è¯ä¸å…¨å±€é…ç½® ====================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG = {
-    # HHanClub è®¤è¯ä¿¡æ¯ (æ¨èåœ¨åŒçº§ç›®å½•ä¸‹ config.json ä¸­é…ç½®)
     "hhan_base_url": "https://hhanclub.net",
     "hhan_cookie": "",
     "hhan_passkey": "",
-    "hhan_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "hhan_ua": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
     "user_id": "",
-    
-    # qBittorrent WebUI è®¤è¯ä¿¡æ¯
     "qb_base_url": "http://127.0.0.1:8080",
     "qb_cookie": "",
     "category_keep": "ä¿ç§",
     "category_del": "å¾…åˆ é™¤",
-
-    # ã€æ ¸å¿ƒç­–ç•¥å‚æ•°ã€‘
-    "max_preservation_space_gb": 4096.0, # ã€ä¿ç§ã€‘åˆ†ç±»ä¸“é¡¹é…é¢ä¸Šé™ 4.0 TB
-    "max_candidate_seeders": 3,          # æ–°å¢å€™é€‰åšç§äººæ•°ä¸Šé™ï¼ˆé»˜è®¤ 3ï¼Œå¯åœ¨ config.json è°ƒæ•´ï¼‰
-    "min_candidate_seeders": 1,          # ç»ä¸ä¸‹è½½ 0 äººæ­»ç§
-    "max_single_download_gb": 80.0,      # å•ä¸ªç§å­æœ€å¤§ä½“ç§¯ (è¶…å¤§åŒ…æ’é™¤)
-    "max_batch_download_gb": 200.0,      # å•æ‰¹æ¬¡æœ€å¤šä¸‹è½½çš„æ€»ä½“ç§¯
-    "max_batch_download_count": 10,       # å•æ‰¹æ¬¡æœ€å¤šæ–°å¢ä»»åŠ¡æ•°
-
-    # ã€å…¨å±€ç»„åˆä¼˜åŒ–å‚æ•°ã€‘
-    "portfolio_unit_gb": 0.10,            # 0/1 èƒŒåŒ…ç¦»æ•£ç²’åº¦ï¼›è¶Šå°è¶Šç²¾ç¡®ï¼Œè®¡ç®—é‡è¶Šå¤§
-    "protect_init_one": True,             # å»¶ç»­åŸç­–ç•¥ï¼šåˆå§‹ 1 äººä¿ç§è§†ä¸ºç¡¬ä¿æŠ¤ï¼Œä¸å‚ä¸æ·˜æ±°
-    "protect_unknown_records": True,      # qB ä¸­æ‰¾ä¸åˆ°å†å²æ¡£æ¡ˆçš„ä¿ç§ä»»åŠ¡é»˜è®¤ä¿æŠ¤ï¼Œé¿å…è¯¯æ·˜æ±°
+    "max_preservation_space_gb": 4096.0,
+    "max_candidate_seeders": 3,
+    "min_candidate_seeders": 1,
+    "max_single_download_gb": 80.0,
+    "max_batch_download_gb": 200.0,
+    "max_batch_download_count": 10,
+    "portfolio_unit_gb": 0.1,
+    "protect_init_one": True,
+    "protect_unknown_records": True,
 }
 
-# åŠ¨æ€åŠ è½½æœ¬åœ° config.jsonï¼ˆå‡­æ®ä¸ç­–ç•¥åˆ†ç¦»ä¿æŠ¤ï¼‰
-_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-if os.path.exists(_config_path):
-    try:
-        with open(_config_path, "r", encoding="utf-8") as _f:
-            _loaded = json.load(_f)
-            CONFIG.update(_loaded)
-    except Exception as _e:
-        print(f"âš ï¸ åŠ è½½ {_config_path} å¼‚å¸¸: {_e}")
 
-# ==================== åŸºç¡€è¾…åŠ©å·¥å…· ====================
-def parse_size_to_gb(size_str: str) -> float:
-    m = re.search(r"([\d\.]+)\s*([KMGTP]?B)", size_str, re.I)
+def load_config():
+    path = os.path.join(BASE_DIR, "config.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        CONFIG.update(data)
+    except Exception as exc:
+        raise RuntimeError(f"åŠ è½½ config.json å¤±è´¥: {exc}") from exc
+
+
+def parse_size_to_gb(text):
+    m = re.search(r"([\d.]+)\s*([KMGTP]?B)", str(text), re.I)
     if not m:
         return 0.0
-    val, unit = float(m.group(1)), m.group(2).upper()
-    if unit == "TB": return val * 1024.0
-    if unit == "GB": return val
-    if unit == "MB": return val / 1024.0
-    if unit == "KB": return val / (1024.0 * 1024.0)
-    return val
+    value = float(m.group(1))
+    unit = m.group(2).upper()
+    factors = {
+        "KB": 1.0 / (1024.0 * 1024.0),
+        "MB": 1.0 / 1024.0,
+        "GB": 1.0,
+        "TB": 1024.0,
+        "PB": 1024.0 * 1024.0,
+    }
+    return value * factors.get(unit, 1.0)
 
-def normalize_name(s: str) -> str:
-    return re.sub(r'[\.\-_\s\[\]\(\)]+', ' ', s.lower()).strip()
 
-def preservation_multiplier(init_seeders: int) -> float:
-    """æ²¿ç”¨ç°æœ‰è„šæœ¬çš„ä¿ç§å€ç‡è§„åˆ™ã€‚"""
+def normalize_name(value):
+    return re.sub(r"[.\-_\s\[\]()]+", " ", str(value).lower()).strip()
+
+
+def preservation_multiplier(init_seeders):
+    init_seeders = int(init_seeders or 0)
     if init_seeders == 1:
         return 2.00
     if 2 <= init_seeders <= 3:
@@ -104,564 +104,804 @@ def preservation_multiplier(init_seeders: int) -> float:
         return 1.50
     return 1.00
 
-def calc_preservation_metrics(size_gb: float, age_weeks: float, curr_seeders: int, init_seeders: int) -> dict:
-    """
-    ç»Ÿä¸€è®¡ç®—å•ä¸ªä¿ç§ä»»åŠ¡çš„ä»·å€¼ã€‚
 
-    value_per_gb æ²¿ç”¨æ—§è„šæœ¬ yield_pts_per_gb çš„å«ä¹‰ï¼š
-      time_factor * seeder_factor * preservation_multiplier
-
-    portfolio_value = size_gb * value_per_gbã€‚
-    å…¨å±€ä¼˜åŒ–å™¨æœ€å¤§åŒ–çš„æ˜¯ 4TB é…é¢å†… portfolio_value ä¹‹å’Œï¼Œ
-    å› æ­¤ç©ºé—´å¤§å°ä¸å†é€šè¿‡äººä¸º size_bonus ä¿®æ­£ï¼Œè€Œæ˜¯ç›´æ¥è¿›å…¥å®¹é‡çº¦æŸã€‚
-    """
+def calc_preservation_metrics(size_gb, age_weeks, curr_seeders, init_seeders):
+    """Return the unified value metrics used by both existing and new torrents."""
     size_gb = max(0.0, float(size_gb or 0.0))
     age_weeks = max(0.1, float(age_weeks or 0.1))
-    curr_seeders = max(1, int(curr_seeders or 1))
-    init_seeders = int(init_seeders or 0)
+    curr_seeders = max(1, int(float(curr_seeders or 1)))
+    init_seeders = int(float(init_seeders or 0))
 
     time_factor = 1.0 - math.pow(10.0, -age_weeks / 8.0)
-    seeder_factor = 1.0 + math.sqrt(2.0) * math.pow(10.0, -max(0.0, (curr_seeders - 1.0)) / 9.0)
-    m_pts = preservation_multiplier(init_seeders)
-    value_per_gb = time_factor * seeder_factor * m_pts
+    seeder_factor = 1.0 + math.sqrt(2.0) * math.pow(
+        10.0, -max(0.0, curr_seeders - 1.0) / 9.0
+    )
+    multiplier = preservation_multiplier(init_seeders)
+    value_per_gb = time_factor * seeder_factor * multiplier
     portfolio_value = size_gb * value_per_gb
-    dpi = 1.0 / max(1e-9, value_per_gb)
-
+    dpi = 1.0 / max(1e-12, value_per_gb)
     return {
         "time_factor": time_factor,
         "seeder_factor": seeder_factor,
-        "m_pts": m_pts,
+        "multiplier": multiplier,
         "value_per_gb": value_per_gb,
         "portfolio_value": portfolio_value,
         "dpi": dpi,
     }
 
-def age_weeks_from_completed_time(value, default: float = 16.0) -> float:
+
+def age_weeks_from_time(value, default=16.0):
     if not value:
         return default
     text = str(value).strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(text, fmt)
-            return max(0.1, (datetime.now() - dt).total_seconds() / (86400.0 * 7.0))
-        except Exception:
+            return max(0.1, (datetime.now() - dt).total_seconds() / 604800.0)
+        except ValueError:
             pass
     return default
 
-def curl_get_hhan(path: str, max_retries: int = 3) -> str:
-    url = f"{CONFIG['hhan_base_url']}/{path.lstrip('/')}"
+
+def curl_get_hhan(path, max_retries=3):
     curl_bin = shutil.which("curl") or "curl"
+    url = f"{CONFIG['hhan_base_url'].rstrip('/')}/{path.lstrip('/')}"
     cmd = [
-        curl_bin, "--noproxy", "*", "-s", "-k", "--compressed",
+        curl_bin,
+        "--noproxy", "*",
+        "-s", "-k", "--compressed",
         "-H", f"User-Agent: {CONFIG['hhan_ua']}",
         "-H", f"Cookie: {CONFIG['hhan_cookie']}",
-        url
+        url,
     ]
-    for attempt in range(max_retries):
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-        if res.stdout and len(res.stdout) > 1000:
-            return res.stdout
+    last = ""
+    for _ in range(max_retries):
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore"
+        )
+        last = result.stdout or ""
+        if len(last) > 500:
+            return last
         time.sleep(1.0)
-    return res.stdout if res.stdout else ""
+    return last
 
-def curl_download_torrent(t_id: str, max_retries: int = 3) -> bytes:
-    url = f"{CONFIG['hhan_base_url']}/download.php?id={t_id}&passkey={CONFIG['hhan_passkey']}"
+
+def curl_download_torrent(torrent_id, max_retries=3):
     curl_bin = shutil.which("curl") or "curl"
+    base = CONFIG["hhan_base_url"].rstrip("/")
+    url = f"{base}/download.php?id={torrent_id}&passkey={CONFIG['hhan_passkey']}"
     cmd = [
-        curl_bin, "--noproxy", "*", "-s", "-k",
+        curl_bin,
+        "--noproxy", "*",
+        "-s", "-k",
         "-H", f"User-Agent: {CONFIG['hhan_ua']}",
         "-H", f"Cookie: {CONFIG['hhan_cookie']}",
-        url
+        url,
     ]
-    for attempt in range(max_retries):
-        res = subprocess.run(cmd, capture_output=True)
-        if res.stdout and len(res.stdout) > 100:
-            return res.stdout
+    last = b""
+    for _ in range(max_retries):
+        result = subprocess.run(cmd, capture_output=True)
+        last = result.stdout or b""
+        if len(last) > 100:
+            return last
         time.sleep(1.0)
-    return res.stdout if res.stdout else b""
+    return last
 
-# ==================== æ¨¡å— 1: æ‰«æä¿ç§åŒºå€™é€‰ç§å­ ====================
-def fetch_rescue_candidates(existing_qb_names: set) -> tuple:
-    print("[1/4] æ­£åœ¨æŠ“å– HHanClub ä¿ç§åŒº (rescue.php) ç§å­åˆ—è¡¨ (æ”¯æŒå¤šé¡µæ‰«æ)...")
+
+def get_qb_session():
+    session = requests.Session()
+    session.verify = False
+    raw_cookie = str(CONFIG.get("qb_cookie", "") or "").strip()
+    if raw_cookie:
+        session.headers.update({"Cookie": raw_cookie})
+    return session
+
+
+def qb_all_torrents(session):
+    url = f"{CONFIG['qb_base_url'].rstrip('/')}/api/v2/torrents/info"
+    response = session.get(url, timeout=20)
+    if response.status_code != 200:
+        raise RuntimeError(f"qBittorrent è¿æ¥å¤±è´¥ï¼ŒHTTP {response.status_code}")
+    return response.json()
+
+
+def is_hhan_torrent(torrent):
+    tracker = str(torrent.get("tracker", "") or "").lower()
+    return "hhan" in tracker
+
+
+def sync_user_preservation_records(force_sync=False, max_age_hours=24.0):
+    active_path = os.path.join(BASE_DIR, "hhan_active_preservation.json")
+    cache_path = os.path.join(BASE_DIR, "user_preservation_cache.json")
+    csv_path = os.path.join(BASE_DIR, "preservation_torrents_ranked.csv")
+
+    if not force_sync and os.path.exists(active_path):
+        try:
+            with open(active_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("records"):
+                return data["records"]
+        except Exception:
+            pass
+
+    if not force_sync and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            updated_at = datetime.fromisoformat(data.get("updated_at", "2000-01-01"))
+            age_hours = (datetime.now() - updated_at).total_seconds() / 3600.0
+            if age_hours < max_age_hours and data.get("records"):
+                return data["records"]
+        except Exception:
+            pass
+
+    if not force_sync and os.path.exists(csv_path):
+        import csv
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            pass
+
+    uid = str(CONFIG.get("user_id", "") or "").strip()
+    if not uid:
+        print("[åŒæ­¥] user_id æœªé…ç½®ï¼Œæ— æ³•åœ¨çº¿åŒæ­¥å†å²æ¡£æ¡ˆï¼›æœ¬è½®æŒ‰ç©ºå†å²å¤„ç†ã€‚")
+        return []
+
+    print("[åŒæ­¥] æ­£åœ¨ä» HHanClub åœ¨çº¿åŒæ­¥ä¿ç§æ¡£æ¡ˆ...")
+    now = datetime.now()
+
+    def parse_row(tds):
+        torrent_id = tds[0].get_text(strip=True)
+        title_a = tds[1].find("a")
+        title = title_a.get_text(strip=True) if title_a else tds[1].get_text(strip=True)
+        size_gb = parse_size_to_gb(tds[2].get_text(strip=True))
+        try:
+            init_n = int(tds[3].get_text(strip=True))
+        except Exception:
+            init_n = 0
+        try:
+            curr_n = int(tds[4].get_text(strip=True))
+        except Exception:
+            curr_n = 0
+        completed_time = tds[5].get_text(strip=True)
+        age_weeks = age_weeks_from_time(completed_time)
+        metrics = calc_preservation_metrics(size_gb, age_weeks, curr_n, init_n)
+        return {
+            "torrent_id": torrent_id,
+            "title": title,
+            "size_gb": round(size_gb, 3),
+            "init_seeders": init_n,
+            "curr_seeders": curr_n,
+            "completed_time": completed_time,
+            "age_weeks": round(age_weeks, 3),
+            "priority_score": round(metrics["dpi"], 6),
+            "dpi": round(metrics["dpi"], 6),
+            "value_per_gb": round(metrics["value_per_gb"], 6),
+            "portfolio_value": round(metrics["portfolio_value"], 6),
+        }
+
+    def fetch_page(page):
+        html = curl_get_hhan(f"userdetails.php?action=7&id={uid}&page={page}")
+        if not html:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        tables = soup.find_all("table")
+        if not tables:
+            return []
+        records = []
+        for row in tables[0].find_all("tr")[1:]:
+            tds = row.find_all("td")
+            if len(tds) >= 6:
+                try:
+                    records.append(parse_row(tds))
+                except Exception:
+                    pass
+        return records
+
+    records = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for page_records in executor.map(fetch_page, range(25)):
+            records.extend(page_records)
+
+    if records:
+        payload = {"updated_at": now.isoformat(), "records": records}
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"      [åŒæ­¥å®Œæˆ] {len(records)} æ¡å†å²æ¡£æ¡ˆ")
+    else:
+        print("      [åŒæ­¥æç¤º] æœªè¯»å–åˆ°å†å²æ¡£æ¡ˆ")
+    return records
+
+
+def match_history_record(qb_torrent, history_records):
+    q_name = normalize_name(qb_torrent.get("name", ""))
+    q_size_gb = float(qb_torrent.get("size", 0) or 0) / (1024.0 ** 3)
+    best = None
+    best_score = None
+    for record in history_records or []:
+        r_name = normalize_name(record.get("title", ""))
+        try:
+            r_size_gb = float(record.get("size_gb", 0) or 0)
+        except Exception:
+            continue
+        if r_size_gb <= 0:
+            continue
+        size_delta = abs(q_size_gb - r_size_gb) / max(r_size_gb, 1e-9)
+        if size_delta >= 0.05:
+            continue
+        if not (q_name == r_name or q_name in r_name or r_name in q_name):
+            continue
+        score = (0 if q_name == r_name else 1, size_delta)
+        if best_score is None or score < best_score:
+            best = record
+            best_score = score
+    return best
+
+
+def check_qb_status(session, history_records):
+    print("[1/4] æ­£åœ¨è¯»å– qBittorrent å½“å‰ä¿ç§ä»»åŠ¡...")
+    torrents = qb_all_torrents(session)
+    existing_names = {normalize_name(t.get("name", "")) for t in torrents}
+    keep = [
+        t for t in torrents
+        if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]
+    ]
+    current_keep_gb = sum(int(t.get("size", 0) or 0) for t in keep) / (1024.0 ** 3)
+
+    items = []
+    unmatched = 0
+    for torrent in keep:
+        size_gb = float(torrent.get("size", 0) or 0) / (1024.0 ** 3)
+        record = match_history_record(torrent, history_records)
+        if record:
+            init_n = int(float(record.get("init_seeders", 0) or 0))
+            curr_n = int(float(record.get("curr_seeders", 0) or 0))
+            try:
+                age_weeks = float(record.get("age_weeks", 0) or 0)
+            except Exception:
+                age_weeks = 0.0
+            if age_weeks <= 0:
+                age_weeks = age_weeks_from_time(record.get("completed_time"))
+            protected = bool(CONFIG.get("protect_init_one", True) and init_n == 1)
+            protect_reason = "åˆå§‹1äººç¡¬ä¿æŠ¤" if protected else ""
+        else:
+            unmatched += 1
+            init_n = 0
+            curr_n = max(1, int(torrent.get("num_complete", 1) or 1))
+            age_weeks = 16.0
+            protected = bool(CONFIG.get("protect_unknown_records", True))
+            protect_reason = "å†å²æ¡£æ¡ˆæœªåŒ¹é…" if protected else ""
+
+        metrics = calc_preservation_metrics(size_gb, age_weeks, curr_n, init_n)
+        items.append({
+            "key": f"existing:{torrent['hash']}",
+            "source": "existing",
+            "hash": torrent["hash"],
+            "title": torrent.get("name", ""),
+            "name": torrent.get("name", ""),
+            "size_gb": size_gb,
+            "init_seeders": init_n,
+            "curr_seeders": curr_n,
+            "age_weeks": age_weeks,
+            "value_per_gb": metrics["value_per_gb"],
+            "portfolio_value": metrics["portfolio_value"],
+            "dpi": metrics["dpi"],
+            "protected": protected,
+            "protect_reason": protect_reason,
+        })
+
+    print(
+        f"      å½“å‰ã€{CONFIG['category_keep']}ã€‘ä¸“é¡¹é…é¢å ç”¨: "
+        f"{current_keep_gb:.2f} GB / {float(CONFIG['max_preservation_space_gb']):.2f} GB"
+    )
+    return existing_names, current_keep_gb, items, unmatched
+
+
+def fetch_rescue_candidates(existing_names):
+    print("[2/4] æ­£åœ¨æ‰«æ HHanClub ä¿ç§åŒºå€™é€‰...")
     cards = []
-    seen_page_ids = set()
-    page = 0
-    max_pages = 20  # å®‰å…¨ç¿»é¡µä¸Šé™
-
-    while page < max_pages:
-        url_path = f"rescue.php?page={page}"
-        html = curl_get_hhan(url_path)
+    seen_ids = set()
+    pages = 0
+    for page in range(20):
+        html = curl_get_hhan(f"rescue.php?page={page}")
         if not html:
             break
         soup = BeautifulSoup(html, "html.parser")
         page_cards = soup.find_all("div", class_=re.compile(r"torrent-table-sub-info"))
         if not page_cards:
             break
-
-        current_ids = []
-        for c in page_cards:
-            name_a = c.find("a", class_=re.compile(r"torrent-info-text-name"))
-            if name_a:
-                m = re.search(r"id=(\d+)", name_a.get("href", ""))
+        page_ids = []
+        for card in page_cards:
+            link = card.find("a", class_=re.compile(r"torrent-info-text-name"))
+            if link:
+                m = re.search(r"id=(\d+)", link.get("href", ""))
                 if m:
-                    current_ids.append(m.group(1))
-
-        # é˜²æ­»å¾ªç¯æ£€æµ‹ï¼šå¦‚æœæ•´é¡µIDå‡å·²è¢«æŠ“å–ï¼Œè¯´æ˜å·²è¶Šç•Œå›ç¯ï¼Œç«‹å³ç»ˆæ­¢
-        new_ids = set(current_ids) - seen_page_ids
-        if not new_ids and page > 0:
+                    page_ids.append(m.group(1))
+        new_ids = set(page_ids) - seen_ids
+        if page > 0 and not new_ids:
             break
-
-        seen_page_ids.update(new_ids)
+        seen_ids.update(new_ids)
         cards.extend(page_cards)
-
-        # è‹¥å½“é¡µå¡ç‰‡æ•°æ˜¾è‘—å°‘äºå¸¸è§„å•é¡µå®¹é‡ï¼Œè¯´æ˜å·²è‡³æœ«é¡µ
-        if len(page_cards) < 30 and page > 0:
-            page += 1
+        pages += 1
+        if len(page_cards) < 30:
             break
-        page += 1
 
-    print(f"      [å¤šé¡µæ£€ç´¢å®Œæˆ] å…±æ£€ç´¢ {page} é¡µï¼Œç´¯è®¡è·å– {len(cards)} ä¸ªä¿ç§åŒºç§å­ã€‚")
-    total_in_zone = len(cards)
-    dead_count = 0
-    crowded_count = 0
-    huge_count = 0
-    already_have = 0
-    high_value_candidates = []
+    stats = {
+        "total_in_zone": len(cards),
+        "dead_count": 0,
+        "crowded_count": 0,
+        "huge_count": 0,
+        "already_have": 0,
+        "eligible_count": 0,
+        "pages": pages,
+    }
+    candidates = []
     now = datetime.now()
 
-    for c in cards:
-        name_a = c.find("a", class_=re.compile(r"torrent-info-text-name"))
-        if not name_a:
+    for card in cards:
+        link = card.find("a", class_=re.compile(r"torrent-info-text-name"))
+        if not link:
             continue
-        title = name_a.get_text(strip=True)
-        m = re.search(r"id=(\d+)", name_a.get("href", ""))
-        t_id = m.group(1) if m else ""
+        title = link.get_text(strip=True)
+        m = re.search(r"id=(\d+)", link.get("href", ""))
+        if not m:
+            continue
+        torrent_id = m.group(1)
 
-        # ä½“ç§¯
-        size_div = c.find("div", class_=re.compile(r"torrent-info-text-size"))
-        size_str = size_div.get_text(strip=True) if size_div else ""
-        size_gb = parse_size_to_gb(size_str)
+        size_div = card.find("div", class_=re.compile(r"torrent-info-text-size"))
+        size_gb = parse_size_to_gb(size_div.get_text(strip=True) if size_div else "")
 
-        # å½“å‰åšç§äººæ•°
-        seed_div = c.find("div", class_=re.compile(r"torrent-info-text-seeders"))
+        seed_div = card.find("div", class_=re.compile(r"torrent-info-text-seeders"))
         try:
             seeders = int(seed_div.get_text(strip=True)) if seed_div else 0
-        except:
+        except Exception:
             seeders = 0
 
-        # å‘å¸ƒæ—¶é—´
-        added_div = c.find("div", class_=re.compile(r"torrent-info-text-added"))
-        span_added = added_div.find("span") if added_div else None
-        added_str = span_added.get("title", "") if span_added else ""
+        added_div = card.find("div", class_=re.compile(r"torrent-info-text-added"))
+        span = added_div.find("span") if added_div else None
+        added_text = span.get("title", "") if span else ""
         age_weeks = 16.0
-        if added_str:
+        if added_text:
             try:
-                dt = datetime.strptime(added_str.strip(), "%Y-%m-%d %H:%M:%S")
-                age_weeks = max(0.1, (now - dt).total_seconds() / (86400.0 * 7.0))
-            except:
+                dt = datetime.strptime(added_text.strip(), "%Y-%m-%d %H:%M:%S")
+                age_weeks = max(0.1, (now - dt).total_seconds() / 604800.0)
+            except ValueError:
                 pass
 
-        # ç»Ÿè®¡è¿‡æ»¤åŸå› 
-        norm_t = normalize_name(title)
-        if norm_t in existing_qb_names or any(norm_t in qn or qn in norm_t for qn in existing_qb_names if len(qnˆLŠN‚ˆ[™XYWÚ]™H
-ÏHBˆÛÛ[YBˆYˆÙYY\œÈÓÓ‘’QÖÈ›Z[—ØØ[™Y]WÜÙYY\œÈ—N‚ˆXYØÛİ[
-ÏHBˆÛÛ[YBˆYˆÚ^™WÙØˆˆÓÓ‘’QÖÈ›X^ÜÚ[™ÛWÙİÛ›ØYÙØˆ—HÜˆÚ^™WÙØˆH‚ˆYÙWØÛİ[
-ÏHBˆÛÛ[YBˆYˆÙYY\œÈˆÓÓ‘’QÖÈ›X^ØØ[™Y]WÜÙYY\œÈ—N‚ˆÜ›İÙYØÛİ[
-ÏHBˆÛÛ[YB‚ˆÈ9®èz-¬ù`&z`"y§hy.í¹d#¹îçù. :+¨yë¥ùîá9d"9/&9c%¹£!ù¨!øà ‚ˆÈ9¬ê9¡#ûï&¹ênºeí9.#ya£z`&º/áÈÚ^™WØ›Û\È9.®¹..¹b¨9§`ûï#: #9å,Hˆ9aj9l`9k®zaãùî©¹§gùæí9£©yi!9ä!¸à ‚ˆY]šXÜÈHØ[×Ü™\Ù\˜][Û—ÛY]šXÜÊÚ^™WÙØ‹YÙWİÙYZÜËÙYY\œËÙYY\œÊBˆØÛÜ™WÜÈHY]šXÜÖÈ˜[YWÜ\—ÙØˆ—B‚ˆYˆÙYY\œÈOHN‚ˆY\ˆH•Y\ˆ
-y.®¹âë9éãJH‚ˆ[YˆÙYY\œÈOH‚ˆY\ˆH•Y\ˆH
-¹.®º"kùéãJH‚ˆ[YˆÙYY\œÈOHÎ‚ˆY\ˆH•Y\ˆˆ
-ù.®¹.+ydàJH‚ˆ[ÙN‚ˆY\ˆHˆ¹`&z`"H
-ÜÙYY\œßy.®ŠH‚‚ˆYÚİ˜[YWØØ[™Y]\Ë˜\[™
-ÂˆšYˆÚYˆ]Hˆ]KˆœÚ^™WÙØˆˆ›İ[™
-Ú^™WÙØ‹ŠKˆœÙYY\œÈˆÙYY\œËˆ˜YÙWİÙYZÜÈˆ›İ[™
-YÙWİÙYZÜËJKˆœØÛÜ™WÜÈˆ›İ[™
-ØÛÜ™WÜËŠKÈ9ao9k®y¥éù¢©ydb¹keù«­{ï&ùã¬:(j9é.¹cey/cHĞˆ9.íù`/ˆ˜[YWÜ\—ÙØˆˆ›İ[™
-Y]šXÜÖÈ˜[YWÜ\—ÙØˆ—KŠKˆœÜ›Û[×İ˜[YHˆ›İ[™
-Y]šXÜÖÈœÜ›Û[×İ˜[YH—KŠKˆY\ˆˆY\‚ˆJB‚ˆYÚİ˜[YWØØ[™Y]\ËœÛÜ
-Ù^O[[X™Hˆ
-È˜[YWÜ\—ÙØˆ—KÈœÜ›Û[×İ˜[YH—JK™]™\œÙOUYJBˆİ[[X\WÙXİHÂˆİ[Ú[—Ş›Û™Hˆİ[Ú[—Ş›Û™Kˆ™XYØÛİ[ˆXYØÛİ[ˆ˜Ü›İÙYØÛİ[ˆÜ›İÙYØÛİ[ˆšYÙWØÛİ[ˆYÙWØÛİ[ˆ˜[™XYWÚ]™Hˆ[™XYWÚ]™Kˆ™[YÚX›WØÛİ[ˆ[ŠYÚİ˜[YWØØ[™Y]\ÊBˆBˆ™]\›ˆYÚİ˜[YWØØ[™Y]\Ëİ[[X\WÙXİ‚ˆÈOOOOOOOOOOOOOOOOOOOH9ª(ygeÈˆ9¨à9§éHPˆ9`f¹éãyâ­¹  y.#¹b¨ú-*9éãHOOOOOOOOOOOOOOOOOOOB™YˆÙ]ÜX—ÜÙ\ÜÚ[ÛŠ
-N‚ˆˆˆ¹b&ùnîˆPš]Üœ™[9/&º+ç{ï#9.#y¢¢ˆÛÛÚÚYH9îäyk¦¹b,9fî¹k¦¹gçùd#xà ‚‚ˆÛÛ™šYË™^[\KšœÛÛˆ:næ:+©9/oùå*LËŒŒŒ{ï#9/a¹k§ºfaz`ê9ïl¹.gùcëú ïz`&º/áùcãyd$y.èùä!¹gçùd#z+¯úeë¸à ‚ˆ9fè9«i9¢¢ºacyïk¹.+yæ¡ÛÛÚÚYH:)èù§¤9..¹¥èÛXZ[ˆ9æ¡Ù\ÜÚ[ÛˆÛÛÚÚY{ï#9cëùd#9¥í¹ao9k®y.)9éãy¥®yo#øà ‚ˆˆˆ‚ˆÈH™\]Y\İË”Ù\ÜÚ[ÛŠ
-Bˆ˜]×ØÛÛÚÚYHHİŠÓÓ‘’QË™Ù]
-œX—ØÛÛÚÚYH‹ˆŠHÜˆˆŠKœİš\
+        normalized = normalize_name(title)
+        if normalized in existing_names or any(
+            normalized in name or name in normalized
+            for name in existing_names
+            if len(name) > 12
+        ):
+            stats["already_have"] += 1
+            continue
+        if seeders < int(CONFIG["min_candidate_seeders"]):
+            stats["dead_count"] += 1
+            continue
+        if seeders > int(CONFIG["max_candidate_seeders"]):
+            stats["crowded_count"] += 1
+            continue
+        if size_gb <= 0 or size_gb > float(CONFIG["max_single_download_gb"]):
+            stats["huge_count"] += 1
+            continue
 
-BˆYˆ˜]×ØÛÛÚÚYN‚ˆ˜\ˆHÚ[\PÛÛÚÚYJ
-BˆN‚ˆ˜\‹›ØY
-˜]×ØÛÛÚÚYJBˆ›ÜˆÙ^K[ÜœÙ[[ˆ˜\‹š][\Ê
-N‚ˆË˜ÛÛÚÚY\ËœÙ]
-Ù^K[ÜœÙ[˜[YJBˆ^Ù\^Ù\[Û‚ˆÈPˆ:`&¹n.9cêºg :) HÒQ;ï&ùclù/oùå*9¢-ùcê¹hjù.¡º(î9`/9.gùl/zaãùao9k®xà ‚ˆÚYH˜]×ØÛÛÚÚYKœÜ]
-H‹JVËLWKœİš\
+        metrics = calc_preservation_metrics(size_gb, age_weeks, seeders, seeders)
+        if seeders == 1:
+            tier = "Tier 0 (1äººç‹¬ç§)"
+        elif seeders == 2:
+            tier = "Tier 1 (2äººè‰¯ç§)"
+        else:
+            tier = f"Tier {seeders - 1} ({seeders}äºº)"
 
-BˆYˆÚY‚ˆË˜ÛÛÚÚY\ËœÙ]
-”ÒQ‹ÚY
-BˆË™\šYHH˜[ÙBˆ™]\›ˆÂ‚™YˆÚXÚ×ÜX—Üİ]\ÊX—ÜÙ\ÜÚ[Û‹˜[šÙYÜ™XÛÜ™×Û\İˆ\İ
-N‚ˆš[
-–Ì‹ÍH9«hùg*:/ç¹£©HPš]Üœ™[:#­ùcå¹/çyéãy.îùb¨{ï#9nm¹.#¹c¡¹cì¹¨hù¨b9d"9nm¹..¹îá9d"9/&9c%¹¬h‹‹ˆŠBˆˆHX—ÜÙ\ÜÚ[Û‹™Ù]
-ˆĞÓÓ‘’QÖÉÜX—Ø˜\ÙWİ\›	×_KØ\KİŒ‹İÜœ™[ËÚ[™›ÈŠBˆYˆ‹œİ]\×ØÛÙHOHŒ‚ˆ˜Z\ÙH^Ù\[ÛŠˆœPš]Üœ™[:/ç¹£©yi,z-){ï#9â­¹  yè NˆÜ‹œİ]\×ØÛÙ_HŠB‚ˆ[İÜœ™[ÈH‹šœÛÛŠ
-Bˆ[—İÜœ™[ÈHİ›Üˆ[ˆ[İÜœ™[ÈYˆš[ˆˆ[ˆ™Ù]
-˜XÚÙ\ˆ‹ˆŠK›İÙ\Š
-WBˆ^\İ[™×Û˜[Y\ÈHÙ]
-›Ü›X[^™WÛ˜[YJÈ›˜[YH—JH›Üˆ[ˆ[İÜœ™[ÊB‚ˆÈˆ9¦+ø '9/çyéãy.$úhnzaczh§x '{ï#9fè9«i:/æzaã9cê¹îçú+¨HØ]YÛÜOy/çyéã{ï#: #9.#y¦+ù¥m9gf9âjyä!¹èàyææ9ch9å*8à ‚ˆÙY\ØØ]YÛÜWİÜœ™[ÈHİ›Üˆ[ˆ[—İÜœ™[ÈYˆ™Ù]
-˜Ø]YÛÜHŠHOHÓÓ‘’QÖÈ˜Ø]YÛÜWÚÙY\—WBˆİ\œ™[ÚÙY\Ø]\ÈHİ[JÈœÚ^™H—H›Üˆ[ˆÙY\ØØ]YÛÜWİÜœ™[ÊBˆİ\œ™[ÚÙY\ÙØˆHİ\œ™[ÚÙY\Ø]\ÈÈ
-LŒ
-ŠˆÊB‚ˆİ\œ™[Ú][\ÈH×Bˆ[›X]ÚYØÛİ[H‚ˆ›Üˆ][ˆÙY\ØØ]YÛÜWİÜœ™[Î‚ˆWÛ›Ü›HH›Ü›X[^™WÛ˜[YJ]È›˜[YH—JBˆWÜÚ^™WÙØˆH]ÈœÚ^™H—HÈ
-LŒ
-ŠˆÊB‚ˆ™XÈH›Û™Bˆ›Üˆ—Ú][H[ˆ
-˜[šÙYÜ™XÛÜ™×Û\İÜˆ×JN‚ˆ—Û›Ü›HH›Ü›X[^™WÛ˜[YJİŠ—Ú][K™Ù]
-]H‹ˆŠJJBˆN‚ˆ—ÜÚ^™WÙØˆH›Ø]
-—Ú][K™Ù]
-œÚ^™WÙØˆ‹Œ
-JBˆ^Ù\^Ù\[Û‚ˆ—ÜÚ^™WÙØˆHŒˆYˆ—ÜÚ^™WÙØˆˆ[™XœÊWÜÚ^™WÙØˆH—ÜÚ^™WÙØŠHÈX^
-YKM—ÜÚ^™WÙØŠHŒN‚ˆYˆWÛ›Ü›HOH—Û›Ü›HÜˆWÛ›Ü›H[ˆ—Û›Ü›HÜˆ—Û›Ü›H[ˆWÛ›Ü›N‚ˆ™XÈH—Ú][Bˆœ™XZÂ‚ˆYˆ™XÎ‚ˆ[š]ÛˆH[
-›Ø]
-™XË™Ù]
-š[š]ÜÙYY\œÈ‹
-HÜˆ
-JBˆİ\œ—ÛˆH[
-›Ø]
-™XË™Ù]
-˜İ\œ—ÜÙYY\œÈ‹
-HÜˆ
-JBˆN‚ˆØXÚYØYÙWİÙYZÜÈH›Ø]
-™XË™Ù]
-˜YÙWİÙYZÜÈ‹Œ
-HÜˆŒ
-Bˆ^Ù\^Ù\[Û‚ˆØXÚYØYÙWİÙYZÜÈHŒˆYÙWİÙYZÜÈHØXÚYØYÙWİÙYZÜÈYˆØXÚYØYÙWİÙYZÜÈˆ[ÙHYÙWİÙYZÜ×Ùœ›ÛWØÛÛ\]Yİ[YJ™XË™Ù]
-˜ÛÛ\]Yİ[YHŠKY˜][LM‹Œ
-BˆY]šXÜÈHØ[×Ü™\Ù\˜][Û—ÛY]šXÜÊWÜÚ^™WÙØ‹YÙWİÙYZÜËİ\œ—Û‹[š]ÛŠBˆ›İXİYH›ÛÛ
-ÓÓ‘’QË™Ù]
-œ›İXİÚ[š]ÛÛ™H‹YJH[™[š]ÛˆOHJBˆ›İXİÜ™X\ÛÛˆH¹b'yiâÌy.®¹èk9/çy¢©ˆYˆ›İXİY[ÙHˆ‚ˆ[ÙN‚ˆÈ9c¡¹cì¹¨hù¨b9ï.¹i,y¥í¹¥è9¬åycëúgh9/,9`/;ï#:næ:+©9èk9/çy¢©;ï#:`oùacy. 9«(yd#9«iyo ¹n.9kï:!í:+ëù­æ9¬l8à ‚ˆ[›X]ÚYØÛİ[
-ÏHBˆ[š]ÛˆHˆİ\œ—ÛˆHX^
-K[
-]™Ù]
-›[WØÛÛ\]H‹JHÜˆJJBˆYÙWİÙYZÜÈHM‹ŒˆY]šXÜÈHØ[×Ü™\Ù\˜][Û—ÛY]šXÜÊWÜÚ^™WÙØ‹YÙWİÙYZÜËİ\œ—Û‹[š]ÛŠBˆ›İXİYH›ÛÛ
-ÓÓ‘’QË™Ù]
-œ›İXİİ[šÛ›İÛ—Ü™XÛÜ™È‹YJJBˆ›İXİÜ™X\ÛÛˆH¹c¡¹cì¹¨hù¨b9ï.¹i,HˆYˆ›İXİY[ÙHˆ‚‚ˆİ\œ™[Ú][\Ë˜\[™
-ÂˆšÙ^Hˆˆ™^\İ[™ÎÜ]ÉÚ\Ú	×_H‹ˆœÛİ\˜ÙHˆ™^\İ[™È‹ˆš\Úˆ]Èš\Ú—Kˆ›˜[YHˆ]È›˜[YH—Kˆ]Hˆ]È›˜[YH—KˆœÚ^™WÙØˆˆWÜÚ^™WÙØ‹ˆš[š]ÜÙYY\œÈˆ[š]Û‹ˆ˜İ\œ—ÜÙYY\œÈˆİ\œ—Û‹ˆ˜YÙWİÙYZÜÈˆYÙWİÙYZÜËˆ˜[YWÜ\—ÙØˆˆY]šXÜÖÈ˜[YWÜ\—ÙØˆ—KˆœÜ›Û[×İ˜[YHˆY]šXÜÖÈœÜ›Û[×İ˜[YH—Kˆ™HˆY]šXÜÖÈ™H—Kˆœ›İXİYˆ›İXİYˆœ›İXİÜ™X\ÛÛˆˆ›İXİÜ™X\ÛÛ‹ˆJB‚ˆ™]\›ˆ^\İ[™×Û˜[Y\Ëİ\œ™[ÚÙY\ÙØ‹İ\œ™[Ú][\Ë[›X]ÚYØÛİ[[ŠÙY\ØØ]YÛÜWİÜœ™[ÊB‚ˆÈOOOOOOOOOOOOOOOOOOOH9ª(ygeÈÎˆ9k®zaãù¬-9/cynlú(hykîyëe¹o%y¤ãˆOOOOOOOOOOOOOOOOOOOB™YˆÚÛ˜\ØXÚ×ÜÙ[Xİ
-][\Îˆ\İØ\XÚ]WÙØˆ›Ø][š]ÙØˆ›Ø]
-HOˆ\İ‚ˆˆˆ‚ˆÌH: ã9c!{ï&¹g*9k®zaãùî©¹§gù."ù§ 9i)ùc%ˆÜ›Û[×İ˜[Yxà ‚ˆ9/oùå*]X\œ˜^H9/çykf9a¬ùëe¸à ºnæ:+©ŒQĞˆ9ì¤¹n©¹¥í»ï#M‘Ğˆ9kîyn¥MŒ9.*¹k®zaãùâ­¹  {ï#ˆ9kîy¥l9æo¹.*¹éãykd9.ãycëùg*9¦kº`&ˆTËÔÈ9."¹ê,ùk¦º/ä:(c8à ‚ˆˆˆ‚ˆYˆ›İ][\ÈÜˆØ\XÚ]WÙØˆH‚ˆ™]\›ˆ×B‚ˆ[š]ÙØˆHX^
-ŒK›Ø]
-[š]ÙØˆÜˆŒJJBˆØ\XÚ]Wİ[š]ÈHX^
-[
-X]™›ÛÜŠØ\XÚ]WÙØˆÈ[š]ÙØˆ
-ÈYKNJJJBˆYˆØ\XÚ]Wİ[š]ÈH‚ˆ™]\›ˆ×B‚ˆÙZYÚÈH×Bˆ˜[Y\ÈH×Bˆš[\™YH×Bˆ›Üˆ][H[ˆ][\Î‚ˆÚ^™WÙØˆHX^
-Œ›Ø]
-][K™Ù]
-œÚ^™WÙØˆ‹Œ
-HÜˆŒ
-JBˆ˜[YHHX^
-Œ›Ø]
-][K™Ù]
-œÜ›Û[×İ˜[YH‹Œ
-HÜˆŒ
-JBˆYˆÚ^™WÙØˆHÜˆ˜[YHH‚ˆÛÛ[YBˆÈ9d$y."¹cå¹¥m;ï#9/çz+àyé®ù¥hù/&9c%¹îäù§§9îçy.#y/&¹fè9..º"#yaiz #9ê yè-9ç'ùk§¹k®zaãù."ºfd8à ‚ˆÈHX^
-K[
-X]˜ÙZ[
-Ú^™WÙØˆÈ[š]ÙØˆHYKLLŠJJBˆYˆÈˆØ\XÚ]Wİ[š]Î‚ˆÛÛ[YBˆš[\™Y˜\[™
-][JBˆÙZYÚË˜\[™
-ÊBˆ˜[Y\Ë˜\[™
-˜[YJB‚ˆYˆ›İš[\™Y‚ˆ™]\›ˆ×B‚ˆ™Y×Ú[™ˆH›Ø]
-‹Z[™ˆŠBˆHÛ™Y×Ú[™—H
-ˆ
-Ø\XÚ]Wİ[š]È
-ÈJBˆÌHHŒˆXÚ\Ú[ÛœÈH×B‚ˆ›ÜˆÚKšH[ˆš\
-ÙZYÚË˜[Y\ÊN‚ˆ›İÈH]X\œ˜^JØ\XÚ]Wİ[š]È
-ÈJBˆ›ÜˆØ\[ˆ˜[™ÙJØ\XÚ]Wİ[š]ËÚHHKLJN‚ˆ™]ˆHØØ\HÚWBˆYˆ™]ˆOH™Y×Ú[™‚ˆÛÛ[YBˆØ[™Y]HH™]ˆ
-ÈšBˆYˆØ[™Y]HˆØØ\H
-ÈYKLL‚ˆØØ\HHØ[™Y]Bˆ›İÖØØ\HHBˆXÚ\Ú[ÛœË˜\[™
-›İÊB‚ˆ™\İØØ\HX^
-˜[™ÙJØ\XÚ]Wİ[š]È
-ÈJKÙ^O[[X™HÎˆØ×JBˆÙ[XİYH×BˆØ\H™\İØØ\ˆ›ÜˆY[ˆ˜[™ÙJ[Šš[\™Y
-HHKLKLJN‚ˆYˆXÚ\Ú[ÛœÖÚYVØØ\N‚ˆÙ[XİY˜\[™
-š[\™YÚYJBˆØ\OHÙZYÚÖÚYBˆÙ[XİYœ™]™\œÙJ
-Bˆ™]\›ˆÙ[XİY‚™YˆÙ[™\˜]WÜİ˜]YŞJİÛ›ØYØØ[™Y]\Îˆ\İİ\œ™[ÚÙY\ÙØˆ›Ø]İ\œ™[Ú][\Îˆ\İ
-N‚ˆX^ÜÜXÙHH›Ø]
-ÓÓ‘’QÖÈ›X^Ü™\Ù\˜][Û—ÜÜXÙWÙØˆ—JBˆX^ÜÜXÙWİˆHX^ÜÜXÙHÈLŒˆ[š]ÙØˆH›Ø]
-ÓÓ‘’QË™Ù]
-œÜ›Û[×İ[š]ÙØˆ‹ŒJJBˆš[
-ˆ–ÌËÍH9«hùg*9¢iú(cÛX^ÜÜXÙWİ‹ŒYŸUˆ9/çyéãy.$úhnzaczh§yæ¡9aj9l`9îá9d"9/&9c%ˆ
-9ì¤¹n©ˆİ[š]ÙØ™ßQĞŠK‹‹ˆŠB‚ˆÈKˆ9b'yiâÌy.®¹éãxà y¨hù¨b9ï.¹i,yéãyëbyèk9/çy¢©:hnyfî¹k¦¹/çyåfxà ‚ˆ›İXİYÚ][\ÈHŞ›Üˆ[ˆİ\œ™[Ú][\ÈYˆ™Ù]
-œ›İXİYŠWBˆÜ[Û˜[Ù^\İ[™ÈHŞ›Üˆ[ˆİ\œ™[Ú][\ÈYˆ›İ™Ù]
-œ›İXİYŠWBˆ›İXİYÙØˆHİ[J›Ø]
-ÈœÚ^™WÙØˆ—JH›Üˆ[ˆ›İXİYÚ][\ÊB‚ˆÈ‹ˆ9l!¹¥¬9`&z`"z/k9£h¹..¹.#¹ã¬9§"y.îùb¨yk£9aj9. :!í9æ¡9¥l9£k¹ª(yg¢øà ‚ˆ™]×Ú][\ÈH×BˆØ[™Y]WØWÚÙ^HHßBˆ›ÜˆÈ[ˆİÛ›ØYØØ[™Y]\Î‚ˆ][HHÂˆšÙ^Hˆˆ›™]ÎØÖÉÚY	×_H‹ˆœÛİ\˜ÙHˆ›™]È‹ˆšYˆÖÈšY—Kˆ]HˆÖÈ]H—Kˆ›˜[YHˆÖÈ]H—KˆœÚ^™WÙØˆˆ›Ø]
-ÖÈœÚ^™WÙØˆ—JKˆš[š]ÜÙYY\œÈˆ[
-ÖÈœÙYY\œÈ—JKˆ˜İ\œ—ÜÙYY\œÈˆ[
-ÖÈœÙYY\œÈ—JKˆ˜YÙWİÙYZÜÈˆ›Ø]
-Ë™Ù]
-˜YÙWİÙYZÜÈ‹M‹Œ
-JKˆ˜[YWÜ\—ÙØˆˆ›Ø]
-Ë™Ù]
-˜[YWÜ\—ÙØˆ‹Ë™Ù]
-œØÛÜ™WÜÈ‹Œ
-JJKˆœÜ›Û[×İ˜[YHˆ›Ø]
-Ë™Ù]
-œÜ›Û[×İ˜[YH‹Œ
-JKˆœ›İXİYˆ˜[ÙKˆY\ˆˆË™Ù]
-Y\ˆ‹ˆŠKˆBˆYˆ][VÈœÜ›Û[×İ˜[YH—HH‚ˆ][VÈœÜ›Û[×İ˜[YH—HH][VÈœÚ^™WÙØˆ—H
-ˆ][VÈ˜[YWÜ\—ÙØˆ—Bˆ™]×Ú][\Ë˜\[™
-][JBˆØ[™Y]WØWÚÙ^VÚ][VÈšÙ^H—WHHÂ‚ˆÈËˆ9g*9/çy¢©:hnych9å*9d#¹æ¡9bjy/fyk®zaãù.+{ï#9kîx '9ã¬9§"ycëù¦ïù£h¹.îùb¨H
-È9¥¬9`&z`"x 'yîçù. 9`fˆÌH: ã9c!xà ‚ˆ™[XZ[š[™×ØØ\XÚ]WÙØˆHX^
-ŒX^ÜÜXÙHH›İXİYÙØŠBˆÙ[XİYÛÜ[Û˜[HÚÛ˜\ØXÚ×ÜÙ[Xİ
-Ü[Û˜[Ù^\İ[™È
-È™]×Ú][\Ë™[XZ[š[™×ØØ\XÚ]WÙØ‹[š]ÙØŠBˆ\™Ù]Ú][\ÈH›İXİYÚ][\È
-ÈÙ[XİYÛÜ[Û˜[ˆ\™Ù]ÚÙ^\ÈHŞÈšÙ^H—H›Üˆ[ˆ\™Ù]Ú][\ßB‚ˆ\™Ù]Û™]ÈHŞ›Üˆ[ˆÙ[XİYÛÜ[Û˜[YˆÈœÛİ\˜ÙH—HOH›™]È—Bˆ\™Ù]Ù^\İ[™ÈHŞ›Üˆ[ˆ\™Ù]Ú][\ÈYˆÈœÛİ\˜ÙH—HOH™^\İ[™È—Bˆ^ÛYYÙ^\İ[™ÈHŞ›Üˆ[ˆÜ[Û˜[Ù^\İ[™ÈYˆÈšÙ^H—H›İ[ˆ\™Ù]ÚÙ^\×B‚ˆÈˆ9ä!º+®¹æë¹¨!ùîá9d"9cëù.éyo¢9i)ûï#9/a¹«ãù«(y¢iú(c9.ãycåùcey¢ny."ú/oy."ºfd9£©ùb-»ï#:`$:/k¹¥-¹¥fûï#:`oùacy. 9«(y )ùi)ù£hº(`8à ‚ˆ\™Ù]Û™]ËœÛÜ
-Ù^O[[X™Hˆ
-È˜[YWÜ\—ÙØˆ—KÈœÜ›Û[×İ˜[YH—JK™]™\œÙOUYJBˆ˜]ÚÛ[Z]ÙØˆH›Ø]
-ÓÓ‘’QË™Ù]
-›X^Ø˜]ÚÙİÛ›ØYÙØˆ‹ŒŒ
-JBˆ˜]ÚÛ[Z]ØÛİ[H[
-ÓÓ‘’QË™Ù]
-›X^Ø˜]ÚÙİÛ›ØYØÛİ[‹L
-JBˆÙ[XİYÛ™]×Ø˜]ÚH×Bˆİİ[ÙØˆHŒˆ›Üˆ][H[ˆ\™Ù]Û™]Î‚ˆYˆ[ŠÙ[XİYÛ™]×Ø˜]Ú
-HH˜]ÚÛ[Z]ØÛİ[‚ˆœ™XZÂˆYˆİİ[ÙØˆ
-È][VÈœÚ^™WÙØˆ—HH˜]ÚÛ[Z]ÙØˆ
-ÈYKNN‚ˆÙ[XİYÛ™]×Ø˜]Ú˜\[™
-][JBˆİİ[ÙØˆ
-ÏH][VÈœÚ^™WÙØˆ—B‚ˆ×ÙİÛ›ØYHØØ[™Y]WØWÚÙ^VŞÈšÙ^H—WH›Üˆ[ˆÙ[XİYÛ™]×Ø˜]ÚB‚ˆÈKˆ9§+:/k¹cêº` 9aî¸ '9..¹.¡¹k®yî¬ù§+:/k¹."ú/oyk§ºfazg :) x 'yæ¡9¥éù.îùb¨{ï#:`oùacy£ä9bcy®!yên¹§*¹§iz/k¹«(y¢czg :) y¦ïù£h¹æ¡9éãxà ‚ˆ›Ú™XİYİİ[ÙØˆHİ\œ™[ÚÙY\ÙØˆ
-Èİİ[ÙØ‚ˆİ™\™›İ×ÙØˆHX^
-Œ›Ú™XİYİİ[ÙØˆHX^ÜÜXÙJBˆ×ÛX\š×Ù[]HH×Bˆœ™YYİİ[ÙØˆHŒ‚ˆÈ9cê¹a`z+®9­æ9¬l8 '9.#yg*9aj9l`9æë¹¨!ùîá9d"9.+x 'yæ¡9ã¬9§"y.îùb¨{ï&ùcey/cQĞ¹.íù`/9§ 9/c¹æ¡9/&9ab:` 9aî¹.$úhnzaczh§xà ‚ˆ^ÛYYÙ^\İ[™ËœÛÜ
-Ù^O[[X™Hˆ
-È˜[YWÜ\—ÙØˆ—K^ÈœÚ^™WÙØˆ—JJBˆ›Üˆ][H[ˆ^ÛYYÙ^\İ[™Î‚ˆYˆœ™YYİİ[ÙØˆ
-ÈYKNHHİ™\™›İ×ÙØ‚ˆœ™XZÂˆ×ÛX\š×Ù[]K˜\[™
-Âˆš\Úˆ][VÈš\Ú—Kˆ›˜[YHˆ][VÈ›˜[YH—KˆœÚ^™WÙØˆˆ›İ[™
-][VÈœÚ^™WÙØˆ—KŠKˆš[š]ÜÙYY\œÈˆ][VÈš[š]ÜÙYY\œÈ—Kˆ˜İ\œ—ÜÙYY\œÈˆ][VÈ˜İ\œ—ÜÙYY\œÈ—Kˆœš[Üš]WÜØÛÜ™Hˆ›İ[™
-][VÈ™H—KŠKˆ˜[YWÜ\—ÙØˆˆ›İ[™
-][VÈ˜[YWÜ\—ÙØˆ—KŠKˆœÜ›Û[×İ˜[YHˆ›İ[™
-][VÈœÜ›Û[×İ˜[YH—KŠKˆœ™X\ÛÛˆˆˆ¹.#yg*¹aj9l`9§ 9/&9îá9d";ï#9cey/cQĞ¹.íù`/^Ú][VÉİ˜[YWÜ\—ÙØ‰×N‹ŒÙŸH‹ˆJBˆœ™YYİİ[ÙØˆ
-ÏH][VÈœÚ^™WÙØˆ—B‚ˆİ\œ™[İ˜[YHHİ[J›Ø]
-™Ù]
-œÜ›Û[×İ˜[YH‹Œ
-JH›Üˆ[ˆİ\œ™[Ú][\ÊBˆ\™Ù]İ˜[YHHİ[J›Ø]
-™Ù]
-œÜ›Û[×İ˜[YH‹Œ
-JH›Üˆ[ˆ\™Ù]Ú][\ÊBˆ\™Ù]ÜÜXÙWÙØˆHİ[J›Ø]
-™Ù]
-œÚ^™WÙØˆ‹Œ
-JH›Üˆ[ˆ\™Ù]Ú][\ÊBˆ›İXİYİ˜[YHHİ[J›Ø]
-™Ù]
-œÜ›Û[×İ˜[YH‹Œ
-JH›Üˆ[ˆ›İXİYÚ][\ÊB‚ˆÜ›Û[×Üİ]ÈHÂˆœ›İXİYØÛİ[ˆ[Š›İXİYÚ][\ÊKˆœ›İXİYÙØˆˆ›İXİYÙØ‹ˆœ›İXİYİ˜[YHˆ›İXİYİ˜[YKˆ\™Ù]ØÛİ[ˆ[Š\™Ù]Ú][\ÊKˆ\™Ù]Ù^\İ[™×ØÛİ[ˆ[Š\™Ù]Ù^\İ[™ÊKˆ\™Ù]Û™]×ØÛİ[ˆ[Š\™Ù]Û™]ÊKˆ\™Ù]ÜÜXÙWÙØˆˆ\™Ù]ÜÜXÙWÙØ‹ˆ˜İ\œ™[İ˜[YHˆİ\œ™[İ˜[YKˆ\™Ù]İ˜[YHˆ\™Ù]İ˜[YKˆ˜[YWÙØZ[ˆˆ\™Ù]İ˜[YHHİ\œ™[İ˜[YKˆ™^ÛYYÙ^\İ[™×ØÛİ[ˆ[Š^ÛYYÙ^\İ[™ÊKˆ˜˜]Úİ\™Ù]Û™]×ØÛİ[ˆ[ŠÙ[XİYÛ™]×Ø˜]Ú
-Kˆ[š]ÙØˆˆ[š]ÙØ‹ˆ›İ™\™›İ×ÙØˆˆİ™\™›İ×ÙØ‹ˆ[œ™\ÛÛ™YÛİ™\™›İ×ÙØˆˆX^
-Œİ™\™›İ×ÙØˆHœ™YYİİ[ÙØŠKˆB‚ˆ™]\›ˆ×ÙİÛ›ØYİİ[ÙØ‹×ÛX\š×Ù[]Kœ™YYİİ[ÙØ‹›Ú™XİYİİ[ÙØ‹Ü›Û[×Üİ]Â‚™Yˆš[Üİ˜]YŞWÜ™\Ü
-×ÙİÛ›ØYİİ[ÙØ‹×ÛX\š×Ù[]Kœ™YYİİ[ÙØ‹İ\œ™[ÚÙY\ÙØ‹›Ú™XİYİİ[ÙØ‹›Û™WÜİ]ËÜ›Û[×Üİ]Ë[›X]ÚYØÛİ[LWÜ[UYJN‚ˆ[ÙWÜİˆH–Ñ–KT•Sˆ:+åz/ä:(c9ª(yo#ÈH9.áyb!¹§¤9kîyëe»ï#9.#y/ë¹¥.HPˆÈ9.#y."ú/oWHˆYˆWÜ[ˆ[ÙH–ÑVPÕUH9¢iú(c9ª(yo#ÈH9«hùg*9k§ºfay¢iú(c9cæ9¦í9.#¹."ú/oWH‚ˆX^ÜÜXÙHHÓÓ‘’QÖÈ›X^Ü™\Ù\˜][Û—ÜÜXÙWÙØˆ—Bˆˆš[
-—ˆˆ
-ÈHˆ
-ˆJBˆš[
-ˆˆ[ÛXˆ9/çyéãyc.¹kîyëe¹b!¹§¤9¢©ydbˆÛ[ÙWÜİŸHŠBˆš[
-Hˆ
-ˆJB‚ˆÈˆ9/çyéãyc.¹­ìyn©º+â¹¥«Bˆš[
-—¼'å#H9/çyéãyc.¹ã¬9g.¹­ìyn©º+â¹¥«H
-9..¹.à9.b9æë¹bcy.#ynîº+«¹æì¹æë¹."ú/o{ï'ÊNˆŠBˆš[
-ˆˆ8 (ˆ9/çyéãyc.¹odùbcy .ú+¨yéãykd9¥lˆŞ›Û™WÜİ]ÖÉİİ[Ú[—Ş›Û™I×_H9.*ˆŠBˆš[
-ˆˆ8 (ˆ9.®¹`f¹éãyæ¡9«nùéãKù¥«yéãNˆŞ›Û™WÜİ]ÖÉÙXYØÛİ[	×_H9.*ˆ
-8¦¨;î#È9.)zaãz+i¹dbˆ9¥è9`f¹éãy®¤;ï#9."ú/oyoáychy«nûï#ùi*z(ªùìîùîçú.(¹aî»ï JHŠBˆš[
-ˆˆ8 (ˆ:-¡yaî¹`&z`"y.®¹¥l:f"9`/ˆŞ›Û™WÜİ]ÖÉØÜ›İÙYØÛİ[	×_H9.*ˆ
-9odùbcHX^ØØ[™Y]WÜÙYY\œÏ^ĞÓÓ‘’QÖÉÛX^ØØ[™Y]WÜÙYY\œÉ×_JHŠBˆš[
-ˆˆ8 (ˆ9ceyc!z-¡y¨!ùi)ùéãH
-ĞÓÓ‘’QÖÉÛX^ÜÚ[™ÛWÙİÛ›ØYÙØ‰×N™ßQĞŠNˆŞ›Û™WÜİ]ÖÉÚYÙWØÛİ[	×_H9.*ˆ
-:-¡z/áùodùbcyceyéãy."ú/oy."ºfd
-HŠBˆš[
-ˆˆ8 (ˆ:/æùaiyîá9d"9/&9c%¹`&z`"y¬h9æ¡9éãykdˆŞ›Û™WÜİ]ÖÉÙ[YÚX›WØÛİ[	×_H9.*ˆ
-9.®¹¥lĞÓÓ‘’QÖÉÛZ[—ØØ[™Y]WÜÙYY\œÉ×__ĞÓÓ‘’QÖÉÛX^ØØ[™Y]WÜÙYY\œÉ×_JHŠB‚ˆÈKˆ9o¡y."ú/oykîyëe‚ˆš[
-ˆ—–Ê×H9. 8à H9£ª:#d9."ú/oyæ¡9/çyéãyc.¹§ ydàKù/&:-*9éãykd
-9alHÛ[Š×ÙİÛ›ØY
-_H9.*»ï#9 .ú+¨HÙİİ[ÙØ‹Œ™ŸHĞŠNˆŠBˆYˆ›İ×ÙİÛ›ØY‚ˆš[
-ˆ8§!H8à$9odùbcy¥è:g 9."ú/oy.îù/eyéãykd8à$HŠBˆYˆ›Û™WÜİ]ÖÉÙ[YÚX›WØÛİ[	×HOH‚ˆš[
-ˆˆ9c§ùfè;ï&¹odùbcy¬¨y§"y®èz-¬ù.®¹¥lĞÓÓ‘’QÖÉÛZ[—ØØ[™Y]WÜÙYY\œÉ×__ĞÓÓ‘’QÖÉÛX^ØØ[™Y]WÜÙYY\œÉ×_xà y/dùéëùëbyèk9§hy.í¹æ¡9`&z`"yéãykd8à ˆŠBˆ[ÙN‚ˆš[
-ˆ9c§ùfè;ï&º&oy§"yd#9¨/9`&z`"{ï#9/a¹¬¨y§"y.îù/ey`&z`"z/æùaiyodùbcHˆ9aj9l`9æë¹¨!ùîá9d";ï#9¢%¹§+:/k¹¢ny«(y."ºfd9¦ ¹§*º/k¹b,8à ˆŠBˆ[ÙN‚ˆš[
-ˆˆÉùn£ùcíÉÎHÉùëbyî©ÉÎMŸHÉù/dùéëÉÎLHÉù`f¹éãy.®¹¥l	ÎHÉù.íù`/ÑĞ‰ÎLHÉùîá9d"9.íù`/	ÎLHÉùéãykd9d#yéì	ßHŠBˆš[
-ˆˆ
-È‹Hˆ
-ˆL
-Bˆ›ÜˆYÈ[ˆ[[Y\˜]J×ÙİÛ›ØYJN‚ˆš[
-ˆˆÚYHØÖÉİY\‰×NMŸHØÖÉÜÚ^™WÙØ‰×NŒ™ŸQĞˆØÖÉÜÙYY\œÉ×NHØË™Ù]
-	İ˜[YWÜ\—ÙØ‰ËÖÉÜØÛÜ™WÜÉ×JNLŒÙŸHØË™Ù]
-	ÜÜ›Û[×İ˜[YIË
-NLŒ™ŸHØÖÉİ]I×VÎŒÎ_HŠB‚ˆÈ‹ˆ9o¡yb(:fi9kîyëe‚ˆš[
-ˆ—–ËWH9.£8à H9£ª:#d:` 9aî¸à$9/çyéãxà$y.$úhnzaczh§ynm¹cæ9¦í9..¸à$ĞÓÓ‘’QÖÉØØ]YÛÜWÙ[	×_xà$yæ¡9.îùb¨H
-9alHÛ[Š×ÛX\š×Ù[]J_H9.*»ï#:h¡:+¨zaâ¹¥/¹/çyéãy.$úhnzaczh§HÙœ™YYİİ[ÙØ‹Œ™ŸHĞŠNˆŠBˆX^ÜÜXÙWİˆHX^ÜÜXÙHÈLŒˆYˆ›İ×ÛX\š×Ù[]N‚ˆš[
-ˆ8§!H8à$9odùbcy¥è:g :` 9aî¹.îù/ey/çyéãy.îùb¨xà$HŠBˆYˆÜ›Û[×Üİ]Ë™Ù]
-[œ™\ÛÛ™YÛİ™\™›İ×ÙØˆ‹Œ
-HˆŒN‚ˆš[
-ˆ9c§ùfè;ï&¹kf9g*9.$úhnzaczh§z-¡zfd;ï#9/a¹odùbcycëù¦ïù£h¹.îùb¨y.#z-¬ûï":`&¹n.9¦+ùèk9/çy¢©:hny¢%¹c¡¹cì¹¨hù¨b9§*¹c.zac{ï"xà ˆŠBˆ[Yˆİ\œ™[ÚÙY\ÙØˆ
-Èİİ[ÙØˆHX^ÜÜXÙH
-ÈYKNN‚ˆš[
-ˆ9c§ùfè;ï&¹odùbcy.îùb¨yb¨9."¹§+:/k¹¥¬9h§¹d#¹.ãyi!9.£¹/çyéãy.$úhnzaczh§ya¡{ï#9¥è:g 9..¹§+:/k¹."ú/oz!o¹/cxà ˆŠBˆ[ÙN‚ˆš[
-ˆ9c§ùfè;ï&¹aj9l`9/&9c%¹îäù§§9§*º) y¬`¹§+:/kº` 9aî¹¥éù.îùb¨xà ˆŠBˆ[ÙN‚ˆš[
-ˆˆÉùn£ùcíÉÎHÉù/dùéëÉÎLHÉùb'yiâù.®¹¥l	ÎHÉùodùbcy.®¹¥l	ÎHÉù.íù`/ÑĞ‰ÎLHÉùc§ùfè:+í9¦#‰ÎÍHÉùéãykd9d#yéì	ßHŠBˆš[
-ˆˆ
-È‹Hˆ
-ˆLLŠBˆ›ÜˆY[ˆ[[Y\˜]J×ÛX\š×Ù[]KJN‚ˆš[
-ˆˆÚYHÜÉÜÚ^™WÙØ‰×NŒ™ŸQĞˆÜÉÚ[š]ÜÙYY\œÉ×NHÜÉØİ\œ—ÜÙYY\œÉ×NHÜ™Ù]
-	İ˜[YWÜ\—ÙØ‰Ë
-NLŒÙŸHÜÉÜ™X\ÛÛ‰×NÍHÜÉÛ˜[YI×VÎŒÌ_HŠB‚ˆÈËˆ9.$úhnzaczh§y.#¹aj9l`9îá9d"9/&9c%¹îäù§§ˆš[˜[ÜÜXÙWÙØˆHİ\œ™[ÚÙY\ÙØˆ
-Èİİ[ÙØˆHœ™YYİİ[ÙØ‚ˆš[
-—ˆˆ
-È‹Hˆ
-ˆJBˆš[
-ˆ¼'äâˆ9."xà HÛX^ÜÜXÙWİ‹ŒYŸUˆ9/çyéãy.$úhnzaczh§y.#¹aj9l`9îá9d"9/&9c%¹ç"ù§oÎˆŠBˆš[
-ˆˆ8 (ˆ9odùbcxà$9/çyéãxà$y.$úhnzaczh§ych9å*ˆØİ\œ™[ÚÙY\ÙØ‹Œ™ŸHĞˆ
-Øİ\œ™[ÚÙY\ÙØ‹ÌLŒ‹Œ™ŸHŠHŠBˆš[
-ˆˆ8 (ˆ9/çyéãy.$úhnzaczh§y."ºfdˆÛX^ÜÜXÙN‹Œ™ŸHĞˆ
-ÛX^ÜÜXÙWİ‹Œ™ŸHŠHŠBˆš[
-ˆˆ8 (ˆ9odùbcy.$úhnzaczh§y/fzaãÎˆÛX^ÜÜXÙHHİ\œ™[ÚÙY\ÙØ‹Œ™ŸHĞˆŠBˆš[
-ˆˆ8 (ˆ9èk9/çy¢©9.îùb¨NˆÜÜ›Û[×Üİ]ÖÉÜ›İXİYØÛİ[	×_H9.*ˆÈÜÜ›Û[×Üİ]ÖÉÜ›İXİYÙØ‰×N‹Œ™ŸHĞˆŠBˆYˆ[›X]ÚYØÛİ[‚ˆš[
-ˆˆ8 (ˆ9am¹.+yc¡¹cì¹¨hù¨b9§*¹c.zacNˆİ[›X]ÚYØÛİ[H9.*»ï"9£"zacyïkºnæ:+©9èk9/çy¢©;ï"HŠBˆš[
-ˆˆ8 (ˆ9aj9l`9æë¹¨!ùîá9d"ˆÜÜ›Û[×Üİ]ÖÉİ\™Ù]ØÛİ[	×_H9.*ˆÈÜÜ›Û[×Üİ]ÖÉİ\™Ù]ÜÜXÙWÙØ‰×N‹Œ™ŸHĞˆŠBˆš[
-ˆˆH9ã¬9§"y.îùb¨y/çyåfNˆÜÜ›Û[×Üİ]ÖÉİ\™Ù]Ù^\İ[™×ØÛİ[	×_H9.*ˆŠBˆš[
-ˆˆH9¥¬9`&z`"yî¬ùaiyæë¹¨!ÎˆÜÜ›Û[×Üİ]ÖÉİ\™Ù]Û™]×ØÛİ[	×_H9.*ˆŠBˆš[
-ˆˆ8 (ˆ9odùbcyîá9d":h¡9­bù.íù`/ˆÜÜ›Û[×Üİ]ÖÉØİ\œ™[İ˜[YI×N‹Œ™ŸHŠBˆš[
-ˆˆ8 (ˆ9æë¹¨!ùîá9d":h¡9­bù.íù`/ˆÜÜ›Û[×Üİ]ÖÉİ\™Ù]İ˜[YI×N‹Œ™ŸH
-3¥ÜÜ›Û[×Üİ]ÖÉİ˜[YWÙØZ[‰×NŠËŒ™ŸJHŠBˆš[
-ˆˆ8 (ˆ9§+:/k¹¥¬9h§¹."ú/oych9å*ˆ
-ŞÙİİ[ÙØ‹Œ™ŸHĞˆŠBˆš[
-ˆˆ8 (ˆ9§+:/kº` 9aî¹/çyéãy.$úhnzaczh§Nˆ^Ùœ™YYİİ[ÙØ‹Œ™ŸHĞˆŠBˆš[
-ˆˆ8 (ˆ9§+:/k¹¢iú(c9d#¸à$9/çyéãxà$zh¡:+¨ych9å*ˆÙš[˜[ÜÜXÙWÙØ‹Œ™ŸHĞˆ
-Ùš[˜[ÜÜXÙWÙØ‹ÌLŒ‹Œ™ŸHˆÈÛX^ÜÜXÙWİ‹Œ™ŸHŠHŠBˆYˆÜ›Û[×Üİ]ÖÉİ[œ™\ÛÛ™YÛİ™\™›İ×ÙØ‰×HˆŒN‚ˆš[
-ˆˆ8¦¨;î#È9.ãy§"HÜÜ›Û[×Üİ]ÖÉİ[œ™\ÛÛ™YÛİ™\™›İ×ÙØ‰×N‹Œ™ŸHĞˆ9¥è9¬åz`&º/áùcëù­æ9¬l9.îùb¨zaâ¹¥/»ï#:+íù¨à9§éyèk9/çy¢©:hny¢%¹c¡¹cì¹¨hù¨b9c.zacxà ˆŠBˆš[
-ˆˆ8 (ˆ9îá9d"9/&9c%¹é®ù¥hùì¤¹n©ˆÜÜ›Û[×Üİ]ÖÉİ[š]ÙØ‰×N‹Œ™ŸHĞ»ï"9d$y."¹cå¹¥m;ï#9k®zaãùî©¹§gù`cù/çyk¢;ï"HŠBˆš[
-Hˆ
-ˆH
-È—ˆŠB‚ˆÈOOOOOOOOOOOOOOOOOOOH9ª(ygeÈˆ9¢iú(c9o%y¤ãˆOOOOOOOOOOOOOOOOOOOB™YˆØİ\œ™[Ú[—ÚÙY\ÙØŠX—ÜÙ\ÜÚ[ÛŠHOˆ›Ø]‚ˆˆˆº+îùcåˆPˆ9.+yodùbcH[¸à$9/çyéãxà$yb!¹ìnùæ¡:`.ú/¤zaczh§ych9å*8à ˆˆˆ‚ˆˆHX—ÜÙ\ÜÚ[Û‹™Ù]
-ˆĞÓÓ‘’QÖÉÜX—Ø˜\ÙWİ\›	×_KØ\KİŒ‹İÜœ™[ËÚ[™›ÈŠBˆYˆ‹œİ]\×ØÛÙHOHŒ‚ˆ˜Z\ÙH^Ù\[ÛŠˆœPš]Üœ™[:/ç¹£©yi,z-){ï#9â­¹  yè NˆÜ‹œİ]\×ØÛÙ_HŠBˆİ[Hˆ›Üˆ[ˆ‹šœÛÛŠ
-N‚ˆYˆ™Ù]
-˜Ø]YÛÜHŠHOHÓÓ‘’QÖÈ˜Ø]YÛÜWÚÙY\—N‚ˆÛÛ[YBˆYˆš[ˆˆ›İ[ˆİŠ™Ù]
-˜XÚÙ\ˆ‹ˆŠJK›İÙ\Š
-N‚ˆÛÛ[YBˆİ[
-ÏH[
-™Ù]
-œÚ^™H‹
-HÜˆ
-Bˆ™]\›ˆİ[È
-LŒ
-ŠˆÊB‚™YˆØ\[™ØØ[™Y]Wİ×ØØXÚJØ[™Y]NˆXİ
-N‚ˆˆˆ¹¢¢¹b&¹£ª:` yæ¡9¥¬9`&z`"ya¦yaiy§+9g,9ï$ùkf;ï#:`oùacyêæyà®y¨hù¨b9l&¹§*¹d#9«iy¥íº(ªùodù¢$9§*¹çéy.îùb¨xà ˆˆˆ‚ˆ˜\ÙWÙ\ˆHÜËœ]™\›˜[YJÜËœ]˜XœÜ]
-×Ùš[W×ÊJBˆØXÚWÜ]HÜËœ]š›Ú[Š˜\ÙWÙ\‹\Ù\—Ü™\Ù\˜][Û—ØØXÚKšœÛÛˆŠBˆN‚ˆYˆÜËœ]™^\İÊØXÚWÜ]
-N‚ˆÚ]Ü[ŠØXÚWÜ]œˆ‹[˜ÛÙ[™ÏH]‹NŠH\È‚ˆÙ]HHœÛÛ‹›ØY
-ŠBˆ[ÙN‚ˆÙ]HHÈ\]YØ]ˆ]][YK››İÊ
-Kš\ÛÙ›Ü›X]
+        candidates.append({
+            "id": torrent_id,
+            "title": title,
+            "size_gb": round(size_gb, 3),
+            "seeders": seeders,
+            "age_weeks": round(age_weeks, 3),
+            "tier": tier,
+            "score_pts": round(metrics["value_per_gb"], 6),
+            "value_per_gb": round(metrics["value_per_gb"], 6),
+            "portfolio_value": round(metrics["portfolio_value"], 6),
+        })
 
-Kœ™XÛÜ™Èˆ×_B‚ˆ™XÛÜ™ÈHÙ]KœÙ]Y˜][
-œ™XÛÜ™È‹×JBˆÜœ™[ÚYHİŠØ[™Y]VÈšY—JBˆÈ:`oùaczaãyi#z/ïyb¨8à ‚ˆ™XÛÜ™ÖÎ—HHÜˆ›Üˆˆ[ˆ™XÛÜ™ÈYˆİŠ‹™Ù]
-Üœ™[ÚY‹ˆŠJHOHÜœ™[ÚYBˆY]šXÜÈHØ[×Ü™\Ù\˜][Û—ÛY]šXÜÊˆØ[™Y]VÈœÚ^™WÙØˆ—KØ[™Y]K™Ù]
-˜YÙWİÙYZÜÈ‹ŒJKˆØ[™Y]VÈœÙYY\œÈ—KØ[™Y]VÈœÙYY\œÈ—Bˆ
-Bˆ™XÛÜ™Ë˜\[™
-ÂˆÜœ™[ÚYˆÜœ™[ÚYˆ]HˆØ[™Y]VÈ]H—KˆœÚ^™WÙØˆˆØ[™Y]VÈœÚ^™WÙØˆ—Kˆš[š]ÜÙYY\œÈˆØ[™Y]VÈœÙYY\œÈ—Kˆ˜İ\œ—ÜÙYY\œÈˆØ[™Y]VÈœÙYY\œÈ—Kˆ˜YÙWİÙYZÜÈˆØ[™Y]K™Ù]
-˜YÙWİÙYZÜÈ‹ŒJKˆ˜ÛÛ\]Yİ[YHˆ]][YK››İÊ
-Kœİ™[YJ‰VKI[KIY	R‰SHŠKˆœš[Üš]WÜØÛÜ™Hˆ›İ[™
-Y]šXÜÖÈ™H—KŠKˆ™Hˆ›İ[™
-Y]šXÜÖÈ™H—KŠKˆ˜[YWÜ\—ÙØˆˆ›İ[™
-Y]šXÜÖÈ˜[YWÜ\—ÙØˆ—KŠKˆœÜ›Û[×İ˜[YHˆ›İ[™
-Y]šXÜÖÈœÜ›Û[×İ˜[YH—KŠKˆJBˆÙ]VÈ\]YØ]—HH]][YK››İÊ
-Kš\ÛÙ›Ü›X]
+    candidates.sort(
+        key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True
+    )
+    stats["eligible_count"] = len(candidates)
+    print(
+        f"      æ‰«æ {pages} é¡µï¼Œä¿ç§åŒº {len(cards)} ä¸ªï¼›"
+        f"åˆæ ¼å€™é€‰ {len(candidates)} ä¸ª"
+    )
+    return candidates, stats
 
-BˆÚ]Ü[ŠØXÚWÜ]È‹[˜ÛÙ[™ÏH]‹NŠH\È‚ˆœÛÛ‹™[\
-Ù]K‹[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆš[
-ˆˆ8¦¨;î#È9¦í9¥¬9§+9g,9/çyéãyï$ùkf9i,z-)NˆÙ^ßHŠB‚™Yˆ^Xİ]WØXİ[ÛœÊX—ÜÙ\ÜÚ[Û‹×ÙİÛ›ØY×ÛX\š×Ù[]JN‚ˆš[
-–ÍÍH9«hùg*9¢iú(c9kîyëe¹¤ãy/g‹‹ˆŠB‚ˆÈKˆ9ab9£ª:` y¥¬9.îùb¨xà ¹cê¹§"y¢$9b§ùb¨9aiHPˆ9æ¡9`&z`"y¢cy/&¹k§ºfayh§¹b¨8à$9/çyéãxà$y.$úhnzaczh§xà ‚ˆYYØÛİ[Hˆ›ÜˆÈ[ˆ×ÙİÛ›ØY‚ˆÚYHÖÈšY—Bˆİ]HHÖÈ]H—Bˆš[
-ˆˆù."ú/oy£ª:` WH9«hùg*:#­ùcå¹éãykd9¥¡ù.íˆŞİÚYH
-İİ]VÎŒÌ_K‹‹ŠK‹‹ˆ‹[™HˆŠBˆÜœ™[Ø]\ÈHİ\›ÙİÛ›ØYİÜœ™[
-ÚY
-BˆYˆ›İÜœ™[Ø]\ÈÜˆ[ŠÜœ™[Ø]\ÊHLÜˆˆ˜[››İ[˜ÙHˆ›İ[ˆÜœ™[Ø]\ÖÎŒLN‚ˆš[
-ˆ8§c9."ú/oyi,z-)HŠBˆÛÛ[YB‚ˆš[\ÈHÂˆÜœ™[Èˆ
-ˆİÚYKÜœ™[‹Üœ™[Ø]\Ë˜\XØ][Û‹ŞXš]Üœ™[ŠBˆBˆ]HHÂˆ˜Ø]YÛÜHˆÓÓ‘’QÖÈ˜Ø]YÛÜWÚÙY\—Kˆ˜]]ÕSHˆYH‹ˆœ]\ÙYˆ™˜[ÙH‚ˆBˆ™\×ØYHX—ÜÙ\ÜÚ[Û‹œÜİ
-ˆĞÓÓ‘’QÖÉÜX—Ø˜\ÙWİ\›	×_KØ\KİŒ‹İÜœ™[ËØY‹š[\ÏYš[\Ë]OY]JBˆYˆ™\×ØYœİ]\×ØÛÙHOHŒ[™™˜Z[Èˆ›İ[ˆ™\×ØY^›İÙ\Š
-N‚ˆš[
-ˆˆÓÒ×H9mì¹£ª9aiHPˆ9nm¹d+ùå*:!ê¹bª9ë¨yä!¹ª(yo#ûï JÜ™\×ØY^œİš\
 
-_JHŠBˆYYØÛİ[
-ÏHBˆØ\[™ØØ[™Y]Wİ×ØØXÚJÊBˆ[ÙN‚ˆš[
-ˆˆÑRSH9£ª:` yi,z-)H
-9â­¹  NˆÜ™\×ØYœİ]\×ØÛÙ_K9dãyn¥ˆÜ™\×ØY^œİš\
+def knapsack_select(items, capacity_gb, unit_gb):
+    """0/1 knapsack maximizing portfolio_value under the dedicated space quota."""
+    if not items or capacity_gb <= 0:
+        return []
+    unit_gb = max(0.05, float(unit_gb or 0.1))
+    capacity = int(math.floor(float(capacity_gb) / unit_gb + 1e-12))
+    if capacity <= 0:
+        return []
 
-_JHŠBˆ[YKœÛY\
-JB‚ˆÈ‹ˆ9."ú/oyk£9¢$9d#ºaãy¥¬:+îùcå¸à$9/çyéãxà$z`.ú/¤zaczh§{ï#9cêº` 9aî¹k§ºfazg :) z!o¹aî¹æ¡9¥éù.îùb¨xà ‚ˆX\šÙYH×BˆYˆ×ÛX\š×Ù[]N‚ˆN‚ˆÙY\ÙØ—ØY\—ØYHØİ\œ™[Ú[—ÚÙY\ÙØŠX—ÜÙ\ÜÚ[ÛŠBˆ™\]Z\™YÙœ™YWÙØˆHX^
-ŒÙY\ÙØ—ØY\—ØYH›Ø]
-ÓÓ‘’QÖÈ›X^Ü™\Ù\˜][Û—ÜÜXÙWÙØˆ—JJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆš[
-ˆˆ8¦¨;î#È9¥è9¬åzaãy¥¬:+îùcå¹/çyéãy.$úhnzaczh§H
-Ù^ßJ{ï#9..º`oùacz+ëú` 9aî¹¥éù.îùb¨{ï#9§+:/kº-ìú/áùb!¹ìnùcæ9¦í8à ˆŠBˆ™\]Z\™YÙœ™YWÙØˆHŒ‚ˆÙ[XİYÙ›Ü—Ù[]HH×BˆÙ[XİYÙØˆHŒˆ›Üˆ][H[ˆ×ÛX\š×Ù[]N‚ˆYˆÙ[XİYÙØˆ
-ÈYKNHH™\]Z\™YÙœ™YWÙØ‚ˆœ™XZÂˆÙ[XİYÙ›Ü—Ù[]K˜\[™
-][JBˆÙ[XİYÙØˆ
-ÏH›Ø]
-][VÈœÚ^™WÙØˆ—JB‚ˆYˆÙ[XİYÙ›Ü—Ù[]N‚ˆ\Ú\ÈHŸ‹š›Ú[ŠÈš\Ú—H›Üˆ[ˆÙ[XİYÙ›Ü—Ù[]JBˆ™\ÈHX—ÜÙ\ÜÚ[Û‹œÜİ
-ˆˆĞÓÓ‘’QÖÉÜX—Ø˜\ÙWİ\›	×_KØ\KİŒ‹İÜœ™[ËÜÙ]Ø]YÛÜH‹ˆ]O^Èš\Ú\Èˆ\Ú\Ë˜Ø]YÛÜHˆÓÓ‘’QÖÈ˜Ø]YÛÜWÙ[—_Bˆ
-BˆYˆ™\Ëœİ]\×ØÛÙHOHŒ‚ˆX\šÙYHÙ[XİYÙ›Ü—Ù[]Bˆš[
-ˆˆùb!¹ìnùcæ9¦íH9mì¹l!ˆÛ[ŠX\šÙY
-_H9.*¹.îùb¨z` 9aî¸à$ĞÓÓ‘’QÖÉØØ]YÛÜWÚÙY\	×_xà$y.$úhnzaczh§ynmº/k9..¸à$ĞÓÓ‘’QÖÉØØ]YÛÜWÙ[	×_xà${ï#:aâ¹¥/¹î©ˆÜÙ[XİYÙØ‹Œ™ŸHĞ¸à ˆŠBˆ[ÙN‚ˆš[
-ˆˆùb!¹ìnùcæ9¦í9i,z-)WH9â­¹  yè NˆÜ™\Ëœİ]\×ØÛÙ_{ï#9§*¹èkº+©9.îù/ey.îùb¨ymìº` 9aî¹.$úhnzaczh§xà ˆŠB‚ˆš[
-ˆ—¼'ã¢H9¢iú(c9aj:`ê9k£9¢$;ï y¢$9b§ù£ª:` y¥¬9h§ˆØYYØÛİ[H9.*¹`&z`"{ï#9k§ºfay¨!ú+¬Û[ŠX\šÙY
-_H9.*¹o¡yb(:fi9.îùb¨xà ˆŠB‚ˆÈOOOOOOOOOOOOOOOOOOOH9/çyéãy¨hù¨b9g*9î¯ùd#9«iy.#¹ï$ùkf9§.¹b-ˆOOOOOOOOOOOOOOOOOOOB™YˆŞ[˜×İ\Ù\—Ü™\Ù\˜][Û—Ü™XÛÜ™Ê˜\ÙWÙ\ˆİ‹›Ü˜ÙWÜŞ[˜Îˆ›ÛÛH˜[ÙKX^ØYÙWÚİ\œÎˆ›Ø]HŒ
-HOˆ\İ‚ˆXİ]™WÜ]HÜËœ]š›Ú[Š˜\ÙWÙ\‹š[—ØXİ]™WÜ™\Ù\˜][Û‹šœÛÛˆŠBˆØXÚWÜ]HÜËœ]š›Ú[Š˜\ÙWÙ\‹\Ù\—Ü™\Ù\˜][Û—ØØXÚKšœÛÛˆŠBˆÜİ—Ü]HÜËœ]š›Ú[Š˜\ÙWÙ\‹œ™\Ù\˜][Û—İÜœ™[×Ü˜[šÙY˜ÜİˆŠB‚ˆÈKˆ9/&9ab:+îùcå¹mì¹¨.9k§¹î«ùaà9æ¡9odùbcy§"y¥b9g*9/çy¥l9£kºfáˆ
-[—ØXİ]™WÜ™\Ù\˜][Û‹šœÛÛŠBˆYˆ›İ›Ü˜ÙWÜŞ[˜È[™ÜËœ]™^\İÊXİ]™WÜ]
-N‚ˆN‚ˆÚ]Ü[ŠXİ]™WÜ]œˆ‹[˜ÛÙ[™ÏH]‹NŠH\È‚ˆXİ]™WÙ]HHœÛÛ‹›ØY
-ŠBˆYˆXİ]™WÙ]K™Ù]
-œ™XÛÜ™ÈŠN‚ˆ™]\›ˆXİ]™WÙ]VÈœ™XÛÜ™È—Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆÈ‹ˆ9¨à9§éyaj:aãù..ú-)¹§+9ï$ùkf9¦+ùd)¹§"y¥b9.%9§*º/áù§'ÂˆYˆ›İ›Ü˜ÙWÜŞ[˜È[™ÜËœ]™^\İÊØXÚWÜ]
-N‚ˆN‚ˆÚ]Ü[ŠØXÚWÜ]œˆ‹[˜ÛÙ[™ÏH]‹NŠH\È‚ˆØXÚWÙ]HHœÛÛ‹›ØY
-ŠBˆ\]YÙH]][YK™œ›ÛZ\ÛÙ›Ü›X]
-ØXÚWÙ]K™Ù]
-\]YØ]‹ŒŒLKLHŠJBˆYÙWÚH
-]][YK››İÊ
-HH\]YÙ
-Kİ[ÜÙXÛÛ™Ê
-HÈÍŒŒˆYˆYÙWÚX^ØYÙWÚİ\œÈ[™ØXÚWÙ]K™Ù]
-œ™XÛÜ™ÈŠN‚ˆ™]\›ˆØXÚWÙ]VÈœ™XÛÜ™È—Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆÈ:"éy§"y¥éÈÔÕˆ9.%9§*º) y¬`¹o.¹b-º e9ïd{ï#9/g9..¹oêú`'ùfçº` ˆYˆ›İ›Ü˜ÙWÜŞ[˜È[™ÜËœ]™^\İÊÜİ—Ü]
-N‚ˆ[\ÜÜİ‚ˆN‚ˆÚ]Ü[ŠÜİ—Ü]œˆ‹[˜ÛÙ[™ÏH]‹N\ÚYÈŠH\È‚ˆ™]\›ˆ\İ
-Üİ‹‘Xİ™XY\ŠŠJBˆ^Ù\^Ù\[Û‚ˆ\ÜÂ‚ˆÈ‹ˆ9k§¹¥íº e9ïdyaj:aãùd#9«iH
-\Ù\™]Z[ËœØXİ[ÛMÊBˆš[
-ˆ–ùd#9«iWH9«hùg*9.ãˆ[ÛXˆ9k§¹¥í¹g*9î¯ùd#9«iy ª9æ¡9aj:`ê9/çyéãy¨hù¨b
-\Ù\™]Z[ËœØXİ[ÛMÊK‹‹ˆŠBˆœ›ÛHÛÛ˜İ\œ™[™]\™\È[\Ü™XYÛÛ^Xİ]Ü‚ˆ›İÈH]][YK››İÊ
-B‚ˆYˆ\œÙWÜ›İÊÊN‚ˆÚYHÖÌK™Ù]İ^
-İš\UYJBˆ]WØHHÖÌWK™š[™
-˜HŠBˆ]HH]WØK™Ù]İ^
-İš\UYJHYˆ]WØH[ÙHÖÌWK™Ù]İ^
-İš\UYJBˆÚ^™WÜİˆHÖÌ—K™Ù]İ^
-İš\UYJBˆÚ^™WÙØˆH\œÙWÜÚ^™Wİ×ÙØŠÚ^™WÜİŠBˆNˆ[š]ÛˆH[
-ÖÌ×K™Ù]İ^
-İš\UYJJBˆ^Ù\ˆ[š]ÛˆHˆNˆİ\œ—ÛˆH[
-ÖÍK™Ù]İ^
-İš\UYJJBˆ^Ù\ˆİ\œ—ÛˆHˆÛÛ\İ[YHHÖÍWK™Ù]İ^
-İš\UYJBˆYÙWİÙYZÜÈHM‹ŒˆN‚ˆH]][YKœİœ[YJÛÛ\İ[YK‰VKI[KIY	R‰SHŠBˆYÙWİÙYZÜÈHX^
-ŒK
-›İÈH
-Kİ[ÜÙXÛÛ™Ê
-HÈ
-Œ
-ˆËŒ
-JBˆ^Ù\ˆ\ÜÂ‚ˆY]šXÜÈHØ[×Ü™\Ù\˜][Û—ÛY]šXÜÊÚ^™WÙØ‹YÙWİÙYZÜËİ\œ—Û‹[š]ÛŠBˆZY[Ü×Ü\—ÙØˆHY]šXÜÖÈ˜[YWÜ\—ÙØˆ—BˆHHY]šXÜÖÈ™H—BˆÜ›Û[×İ˜[YHHY]šXÜÖÈœÜ›Û[×İ˜[YH—B‚ˆÈš[Üš]WÜØÛÜ™H9.áy..¹ao9k®y¥éùï$ùkfĞÔÕ»ï&ÕŒˆ9a¬ùëe¹.#ya£y/§z-e¹¢bùméy­æ9¬l:)á9b&xà ‚ˆÜØÛÜ™HHB‚ˆ™]\›ˆÂˆÜœ™[ÚYˆÚYˆ]Hˆ]KˆœÚ^™WÙØˆˆ›İ[™
-Ú^™WÙØ‹ÊKˆš[š]ÜÙYY\œÈˆ[š]Û‹ˆ˜İ\œ—ÜÙYY\œÈˆİ\œ—Û‹ˆ˜ÛÛ\]Yİ[YHˆÛÛ\İ[YKˆ˜YÙWİÙYZÜÈˆ›İ[™
-YÙWİÙYZÜËÊKˆœš[Üš]WÜØÛÜ™Hˆ›İ[™
-ÜØÛÜ™KŠKˆ™Hˆ›İ[™
-KŠKˆ˜[YWÜ\—ÙØˆˆ›İ[™
-ZY[Ü×Ü\—ÙØ‹ŠKˆœÜ›Û[×İ˜[YHˆ›İ[™
-Ü›Û[×İ˜[YKŠBˆB‚ˆZYHÓÓ‘’QÖÈ\Ù\—ÚY—BˆYˆ™]ÚÜYÙJ
-N‚ˆ[Hİ\›ÙÙ]Ú[Šˆ\Ù\™]Z[ËœØXİ[ÛMÉšY^İZYIœYÙO^ÜHŠBˆYˆ›İ[ˆ™]\›ˆ×BˆÛİ\H™X]]Y[Ûİ\
-[š[œ\œÙ\ˆŠBˆX›\ÈHÛİ\™š[™Ø[
-X›HŠBˆYˆ›İX›\Îˆ™]\›ˆ×Bˆ›İÜÈHX›\ÖÌK™š[™Ø[
-ˆŠBˆ™]\›ˆÜ\œÙWÜ›İÊ‹™š[™Ø[
-ŠJH›Üˆˆ[ˆ›İÜÖÌN—HYˆ[Š‹™š[™Ø[
-ŠJHH—B‚ˆ[Ü™XÛÜ™ÈH×BˆÚ]™XYÛÛ^Xİ]ÜŠX^İÛÜšÙ\œÏMJH\È^‚ˆYÙ\×Ù]HH\İ
-^›X\
-™]ÚÜYÙK˜[™ÙJJJJBˆ›Üˆ[ˆYÙ\×Ù]N‚ˆ[Ü™XÛÜ™Ë™^[™
-
-B‚ˆYˆ[Ü™XÛÜ™Î‚ˆØXÚWÙ]HHÈ\]YØ]ˆ›İËš\ÛÙ›Ü›X]
+    filtered = []
+    weights = []
+    values = []
+    for item in items:
+        size_gb = max(0.0, float(item.get("size_gb", 0) or 0))
+        value = max(0.0, float(item.get("portfolio_value", 0) or 0))
+        if size_gb <= 0 or value <= 0:
+            continue
+        weight = max(1, int(math.ceil(size_gb / unit_gb - 1e-12)))
+        if weight > capacity:
+            continue
+        filtered.append(item)
+        weights.append(weight)
+        values.append(value)
 
-Kœ™XÛÜ™Èˆ[Ü™XÛÜ™ßBˆÚ]Ü[ŠØXÚWÜ]È‹[˜ÛÙ[™ÏH]‹NŠH\È‚ˆœÛÛ‹™[\
-ØXÚWÙ]K‹[œİ\™WØ\ØÚZOQ˜[ÙK[™[LŠBˆš[
-ˆˆùd#9«iyk£9¢$H9mì¹¢$9b§ùg*9î¯ùd#9«iynm¹£ y.ayc%¹ï$ùkfÛ[Š[Ü™XÛÜ™Ê_H9§hy`f¹éãy¨hù¨b;ï HŠB‚ˆ™]\›ˆ[Ü™XÛÜ™Â‚ˆÈOOOOOOOOOOOOOOOOOOOH9..ùaiycèÈOOOOOOOOOOOOOOOOOOOB™YˆXZ[Š
-N‚ˆ\œÙ\ˆH\™Ü\œÙK\™İ[Y[\œÙ\Š\ØÜš\[ÛH’[ÛXˆ9/çyéãyc.º!ê¹bª9c%¹îï9d"9ë¨yä!¹­`y¬-9î¯ú!&¹§+ŠBˆ\œÙ\‹˜YØ\™İ[Y[
-‹KY^Xİ]H‹Xİ[ÛHœİÜ™WİYH‹[H¹k§ºfay¢iú(c9b!¹ìnùcæ9¦í9.#¹."ú/oy¤ãy/g
-:næ:+©9..ˆK\[ˆ:+åz/ä:(c
-HŠBˆ\œÙ\‹˜YØ\™İ[Y[
-‹K\Ş[˜È‹Xİ[ÛHœİÜ™WİYH‹[H¹o.¹b-¹.ã¹êæyà®yaj:aãùg*9î¯úaãy¥¬9d#9«iyå*9¢-ùæ¡9/çyéãy¨hù¨b
-Xİ[ÛMÊHŠBˆ\™ÜÈH\œÙ\‹œ\œÙWØ\™ÜÊ
-B‚ˆWÜ[ˆH›İ\™ÜË™^Xİ]B‚ˆ˜\ÙWÙ\ˆHÜËœ]™\›˜[YJÜËœ]˜XœÜ]
-×Ùš[W×ÊJBˆ˜[šÙYÜ™XÛÜ™×Û\İHŞ[˜×İ\Ù\—Ü™\Ù\˜][Û—Ü™XÛÜ™Ê˜\ÙWÙ\‹›Ü˜ÙWÜŞ[˜ÏX\™ÜËœŞ[˜ÊB‚ˆX—ÜÈHÙ]ÜX—ÜÙ\ÜÚ[ÛŠ
-B‚ˆÈKˆ9¨à9§éHPˆ9â­¹  Bˆ^\İ[™×ÜX—Û˜[Y\Ëİ\œ™[ÚÙY\ÙØ‹İ\œ™[Ú][\Ë[›X]ÚYØÛİ[ÙY\ØÛİ[HÚXÚ×ÜX—Üİ]\ÊX—ÜË˜[šÙYÜ™XÛÜ™×Û\İ
-B‚ˆÈ‹ˆ9¢jù£ãù/çyéãyc.¹`&z`"yéãH
-9i&ºhmz!êº` ¹n¥
-BˆİÛ›ØYØØ[™Y]\Ë›Û™WÜİ]ÈH™]ÚÜ™\ØİYWØØ[™Y]\Ê^\İ[™×ÜX—Û˜[Y\ÊB‚ˆÈËˆˆ9/çyéãy.$úhnzaczh§yaj9l`9îá9d"9/&9c%‚ˆ×ÙİÛ›ØYİİ[ÙØ‹×ÛX\š×Ù[]Kœ™YYİİ[ÙØ‹›Ú™XİYİİ[ÙØ‹Ü›Û[×Üİ]ÈHÙ[™\˜]WÜİ˜]YŞJˆİÛ›ØYØØ[™Y]\Ëİ\œ™[ÚÙY\ÙØ‹İ\œ™[Ú][\Âˆ
-B‚ˆÈˆ9¢dùcl9¢©ydb‚ˆš[Üİ˜]YŞWÜ™\Ü
-ˆ×ÙİÛ›ØYİİ[ÙØ‹×ÛX\š×Ù[]Kœ™YYİİ[ÙØ‹İ\œ™[ÚÙY\ÙØ‹›Ú™XİYİİ[ÙØ‹ˆ›Û™WÜİ]ËÜ›Û[×Üİ]Ë[›X]ÚYØÛİ[][›X]ÚYØÛİ[WÜ[YWÜ[‚ˆ
-B‚ˆÈKˆ9¢iú(cˆYˆ›İWÜ[‚ˆ^Xİ]WØXİ[ÛœÊX—ÜË×ÙİÛ›ØY×ÛX\š×Ù[]JBˆ[ÙN‚ˆš[
-¼'ä¨H9odùbcy..ˆ–KT•Sˆ:+åz/ä:(c9ª(yo#øà º"éyèkº+©9.éy."¹kîyëe¹¥è:+ëûï#9cëú/ä:(c9doy.é9o 9iâùk§ºfay¢iú(c;ï&ˆŠBˆš[
-ˆ]Ûˆ[—Ü›Û™WÛX[˜YÙ\‹œHKY^Xİ]WˆŠB‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×È‚ˆXZ[Š
-B
+    if not filtered:
+        return []
+
+    neg_inf = float("-inf")
+    dp = [neg_inf] * (capacity + 1)
+    dp[0] = 0.0
+    decisions = []
+
+    for weight, value in zip(weights, values):
+        row = bytearray(capacity + 1)
+        for cap in range(capacity, weight - 1, -1):
+            prev = dp[cap - weight]
+            if prev == neg_inf:
+                continue
+            candidate = prev + value
+            if candidate > dp[cap] + 1e-12:
+                dp[cap] = candidate
+                row[cap] = 1
+        decisions.append(row)
+
+    cap = max(range(capacity + 1), key=lambda c: dp[c])
+    selected = []
+    for idx in range(len(filtered) - 1, -1, -1):
+        if decisions[idx][cap]:
+            selected.append(filtered[idx])
+            cap -= weights[idx]
+    selected.reverse()
+    return selected
+
+
+def generate_strategy(candidates, current_keep_gb, current_items):
+    print("[3/4] æ­£åœ¨æ‰§è¡Œ 4TB ä¿ç§ä¸“é¡¹é…é¢å…¨å±€ç»„åˆä¼˜åŒ–...")
+    max_space = float(CONFIG["max_preservation_space_gb"])
+    unit_gb = float(CONFIG.get("portfolio_unit_gb", 0.1))
+
+    protected = [item for item in current_items if item.get("protected")]
+    optional_existing = [item for item in current_items if not item.get("protected")]
+    protected_gb = sum(float(item["size_gb"]) for item in protected)
+
+    new_items = []
+    candidate_lookup = {}
+    for candidate in candidates:
+        key = f"new:{candidate['id']}"
+        item = {
+            "key": key,
+            "source": "new",
+            "id": candidate["id"],
+            "title": candidate["title"],
+            "name": candidate["title"],
+            "size_gb": float(candidate["size_gb"]),
+            "init_seeders": int(candidate["seeders"]),
+            "curr_seeders": int(candidate["seeders"]),
+            "age_weeks": float(candidate.get("age_weeks", 16.0)),
+            "value_per_gb": float(candidate["value_per_gb"]),
+            "portfolio_value": float(candidate["portfolio_value"]),
+            "protected": False,
+        }
+        new_items.append(item)
+        candidate_lookup[key] = candidate
+
+    remaining = max(0.0, max_space - protected_gb)
+    selected_optional = knapsack_select(optional_existing + new_items, remaining, unit_gb)
+    target = protected + selected_optional
+    target_keys = {item["key"] for item in target}
+
+    target_new = [item for item in selected_optional if item["source"] == "new"]
+    target_existing = [item for item in target if item["source"] == "existing"]
+    excluded_existing = [
+        item for item in optional_existing if item["key"] not in target_keys
+    ]
+
+    target_new.sort(
+        key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True
+    )
+    batch_gb = float(CONFIG.get("max_batch_download_gb", 200.0))
+    batch_count = int(CONFIG.get("max_batch_download_count", 10))
+    selected_batch = []
+    download_gb = 0.0
+    for item in target_new:
+        if len(selected_batch) >= batch_count:
+            break
+        if download_gb + item["size_gb"] <= batch_gb + 1e-9:
+            selected_batch.append(item)
+            download_gb += item["size_gb"]
+
+    to_download = [candidate_lookup[item["key"]] for item in selected_batch]
+
+    projected = current_keep_gb + download_gb
+    overflow = max(0.0, projected - max_space)
+    excluded_existing.sort(key=lambda x: (x["value_per_gb"], -x["size_gb"]))
+    to_mark_delete = []
+    marked_gb = 0.0
+    for item in excluded_existing:
+        if marked_gb + 1e-9 >= overflow:
+            break
+        to_mark_delete.append({
+            "hash": item["hash"],
+            "name": item["name"],
+            "size_gb": round(item["size_gb"], 3),
+            "init_seeders": item["init_seeders"],
+            "curr_seeders": item["curr_seeders"],
+            "value_per_gb": round(item["value_per_gb"], 6),
+            "portfolio_value": round(item["portfolio_value"], 6),
+            "reason": "ä¸åœ¨4TBç›®æ ‡ç»„åˆ",
+        })
+        marked_gb += item["size_gb"]
+
+    current_value = sum(float(x.get("portfolio_value", 0)) for x in current_items)
+    target_value = sum(float(x.get("portfolio_value", 0)) for x in target)
+    stats = {
+        "protected_count": len(protected),
+        "protected_gb": protected_gb,
+        "target_count": len(target),
+        "target_existing_count": len(target_existing),
+        "target_new_count": len(target_new),
+        "target_space_gb": sum(float(x["size_gb"]) for x in target),
+        "current_value": current_value,
+        "target_value": target_value,
+        "value_gain": target_value - current_value,
+        "unit_gb": unit_gb,
+        "unresolved_overflow_gb": max(0.0, overflow - marked_gb),
+    }
+    return to_download, download_gb, to_mark_delete, marked_gb, projected, stats
+
+
+def print_strategy_report(
+    to_download,
+    download_gb,
+    to_mark_delete,
+    marked_gb,
+    current_keep_gb,
+    zone_stats,
+    portfolio_stats,
+    unmatched_count,
+    dry_run,
+):
+    max_space = float(CONFIG["max_preservation_space_gb"])
+    mode = "DRY-RUN" if dry_run else "EXECUTE"
+    print("\n" + "=" * 88)
+    print(f"HHanClub ä¿ç§åŒºç­–ç•¥æŠ¥å‘Š [{mode}]")
+    print("=" * 88)
+    print(
+        f"ä¿ç§åŒº: {zone_stats['total_in_zone']} ä¸ª | "
+        f"å·²æœ‰ {zone_stats['already_have']} | "
+        f"0äºº {zone_stats['dead_count']} | "
+        f"è¶…äººæ•°é˜ˆå€¼ {zone_stats['crowded_count']} | "
+        f"è¶…ä½“ç§¯é˜ˆå€¼ {zone_stats['huge_count']} | "
+        f"å€™é€‰ {zone_stats['eligible_count']}"
+    )
+    print(
+        f"å½“å‰ã€{CONFIG['category_keep']}ã€‘ä¸“é¡¹é…é¢: {current_keep_gb:.2f} / "
+        f"{max_space:.2f} GB ({current_keep_gb / 1024.0:.2f} TB)"
+    )
+    print(
+        f"å…¨å±€ç›®æ ‡ç»„åˆ: {portfolio_stats['target_count']} ä¸ª / "
+        f"{portfolio_stats['target_space_gb']:.2f} GB | "
+        f"é¢„æµ‹ä»·å€¼ {portfolio_stats['current_value']:.2f} -> "
+        f"{portfolio_stats['target_value']:.2f} "
+        f"(Î” {portfolio_stats['value_gain']:+.2f})"
+    )
+    print(
+        f"ç¡¬ä¿æŠ¤: {portfolio_stats['protected_count']} ä¸ª / "
+        f"{portfolio_stats['protected_gb']:.2f} GB | "
+        f"å†å²æœªåŒ¹é…: {unmatched_count} ä¸ª"
+    )
+
+    print(f"\n[+] æœ¬è½®æ–°å¢: {len(to_download)} ä¸ª / {download_gb:.2f} GB")
+    for idx, item in enumerate(to_download, 1):
+        print(
+            f"  {idx:>2}. {item['size_gb']:>7.2f} GB | "
+            f"{item['seeders']}äºº | ä»·å€¼/GB {item['value_per_gb']:.3f} | "
+            f"{item['title']}"
+        )
+
+    print(
+        f"\n[-] æœ¬è½®é€€å‡ºã€{CONFIG['category_keep']}ã€‘ä¸“é¡¹é…é¢: "
+        f"{len(to_mark_delete)} ä¸ª / {marked_gb:.2f} GB"
+    )
+    for idx, item in enumerate(to_mark_delete, 1):
+        print(
+            f"  {idx:>2}. {item['size_gb']:>7.2f} GB | "
+            f"ä»·å€¼/GB {item['value_per_gb']:.3f} | {item['name']}"
+        )
+
+    final_estimate = current_keep_gb + download_gb - marked_gb
+    print(
+        f"\næœ¬è½®æ‰§è¡Œåé¢„è®¡ä¸“é¡¹é…é¢: {final_estimate:.2f} GB / {max_space:.2f} GB"
+    )
+    if portfolio_stats["unresolved_overflow_gb"] > 0.01:
+        print(
+            f"âš ï¸ ä»æœ‰ {portfolio_stats['unresolved_overflow_gb']:.2f} GB "
+            "æ— æ³•é‡Šæ”¾ï¼Œè¯·æ£€æŸ¥ç¡¬ä¿æŠ¤é¡¹å’Œå†å²åŒ¹é…ã€‚"
+        )
+    print(f"èƒŒåŒ…ç¦»æ•£ç²’åº¦: {portfolio_stats['unit_gb']:.2f} GB")
+    print("=" * 88 + "\n")
+
+
+def append_candidate_to_cache(candidate):
+    path = os.path.join(BASE_DIR, "user_preservation_cache.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        else:
+            payload = {"updated_at": datetime.now().isoformat(), "records": []}
+        records = payload.setdefault("records", [])
+        torrent_id = str(candidate["id"])
+        records[:] = [r for r in records if str(r.get("torrent_id", "")) != torrent_id]
+        metrics = calc_preservation_metrics(
+            candidate["size_gb"],
+            candidate.get("age_weeks", 0.1),
+            candidate["seeders"],
+            candidate["seeders"],
+        )
+        records.append({
+            "torrent_id": torrent_id,
+            "title": candidate["title"],
+            "size_gb": candidate["size_gb"],
+            "init_seeders": candidate["seeders"],
+            "curr_seeders": candidate["seeders"],
+            "age_weeks": candidate.get("age_weeks", 0.1),
+            "completed_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "priority_score": round(metrics["dpi"], 6),
+            "dpi": round(metrics["dpi"], 6),
+            "value_per_gb": round(metrics["value_per_gb"], 6),
+            "portfolio_value": round(metrics["portfolio_value"], 6),
+        })
+        payload["updated_at"] = datetime.now().isoformat()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"      âš ï¸ æ›´æ–°æœ¬åœ°ç¼“å­˜å¤±è´¥: {exc}")
+
+
+def current_keep_gb(session):
+    torrents = qb_all_torrents(session)
+    total = sum(
+        int(t.get("size", 0) or 0)
+        for t in torrents
+        if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]
+    )
+    return total / (1024.0 ** 3)
+
+
+def execute_actions(session, to_download, to_mark_delete):
+    print("[4/4] æ­£åœ¨æ‰§è¡Œæœ¬è½®æ“ä½œ...")
+    base = CONFIG["qb_base_url"].rstrip("/")
+    added = 0
+
+    for candidate in to_download:
+        torrent_bytes = curl_download_torrent(candidate["id"])
+        if not torrent_bytes or len(torrent_bytes) < 100:
+            print(f"      âŒ #{candidate['id']} ç§å­æ–‡ä»¶ä¸‹è½½å¤±è´¥")
+            continue
+        files = {
+            "torrents": (
+                f"{candidate['id']}.torrent",
+                torrent_bytes,
+                "application/x-bittorrent",
+            )
+        }
+        data = {
+            "category": CONFIG["category_keep"],
+            "autoTMM": "true",
+            "paused": "false",
+        }
+        response = session.post(
+            f"{base}/api/v2/torrents/add", files=files, data=data, timeout=30
+        )
+        if response.status_code == 200 and "fails" not in response.text.lower():
+            added += 1
+            append_candidate_to_cache(candidate)
+            print(f"      âœ… å·²åŠ å…¥ #{candidate['id']} {candidate['title'][:40]}")
+        else:
+            print(
+                f"      âŒ #{candidate['id']} åŠ å…¥ qB å¤±è´¥: "
+                f"HTTP {response.status_code} {response.text.strip()}"
+            )
+        time.sleep(0.5)
+
+    marked = 0
+    if to_mark_delete:
+        try:
+            required_free = max(
+                0.0,
+                current_keep_gb(session) - float(CONFIG["max_preservation_space_gb"]),
+            )
+        except Exception as exc:
+            print(f"      âš ï¸ æ— æ³•å¤æ ¸ qB é…é¢ï¼Œè·³è¿‡é€€å‡ºæ—§ä»»åŠ¡: {exc}")
+            required_free = 0.0
+
+        selected = []
+        selected_gb = 0.0
+        for item in to_mark_delete:
+            if selected_gb + 1e-9 >= required_free:
+                break
+            selected.append(item)
+            selected_gb += float(item["size_gb"])
+
+        if selected:
+            hashes = "|".join(item["hash"] for item in selected)
+            response = session.post(
+                f"{base}/api/v2/torrents/setCategory",
+                data={"hashes": hashes, "category": CONFIG["category_del"]},
+                timeout=20,
+            )
+            if response.status_code == 200:
+                marked = len(selected)
+                print(
+                    f"      âœ… {marked} ä¸ªæ—§ä»»åŠ¡è½¬ä¸ºã€{CONFIG['category_del']}ã€‘ï¼Œ"
+                    f"é€€å‡ºä¸“é¡¹é…é¢çº¦ {selected_gb:.2f} GB"
+                )
+            else:
+                print(f"      âŒ åˆ†ç±»å˜æ›´å¤±è´¥: HTTP {response.status_code}")
+
+    print(f"æ‰§è¡Œå®Œæˆï¼šæ–°å¢ {added} ä¸ªï¼Œè½¬ä¸ºã€{CONFIG['category_del']}ã€‘ {marked} ä¸ªã€‚")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HHanClub ä¿ç§åŒºè‡ªåŠ¨åŒ–ç»¼åˆç®¡ç†")
+    parser.add_argument(
+        "--execute", action="store_true", help="å®é™…æ‰§è¡Œä¸‹è½½å’Œåˆ†ç±»å˜æ›´ï¼›é»˜è®¤ä»… dry-run"
+    )
+    parser.add_argument(
+        "--sync", action="store_true", help="å¼ºåˆ¶ä» action=7 é‡æ–°åŒæ­¥å†å²ä¿ç§æ¡£æ¡ˆ"
+    )
+    args = parser.parse_args()
+
+    load_config()
+    history = sync_user_preservation_records(force_sync=args.sync) or []
+    session = get_qb_session()
+    existing_names, keep_gb, current_items, unmatched = check_qb_status(session, history)
+    candidates, zone_stats = fetch_rescue_candidates(existing_names)
+    (
+        to_download,
+        download_gb,
+        to_mark_delete,
+        marked_gb,
+        _projected,
+        portfolio_stats,
+    ) = generate_strategy(candidates, keep_gb, current_items)
+
+    dry_run = not args.execute
+    print_strategy_report(
+        to_download,
+        download_gb,
+        to_mark_delete,
+        marked_gb,
+        keep_gb,
+        zone_stats,
+        portfolio_stats,
+        unmatched,
+        dry_run,
+    )
+
+    if args.execute:
+        execute_actions(session, to_download, to_mark_delete)
+    else:
+        print("DRY-RUNï¼šç¡®è®¤ç­–ç•¥åè¿è¡Œ python hhan_pzone_manager.py --execute")
+
+
+if __name__ == "__main__":
+    main()
