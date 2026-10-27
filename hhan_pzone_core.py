@@ -1183,6 +1183,9 @@ def execute_actions(session, to_download, to_mark_delete):
         if metadata["size_gb"] > safe_float(CONFIG["max_single_download_gb"]) + 1e-9:
             print(f"      #{candidate['id']} 实际大小超过单种上限，跳过")
             continue
+        if known_added_gb + metadata["size_gb"] > safe_float(CONFIG["max_batch_download_gb"]) + 1e-9:
+            print(f"      #{candidate['id']} 实际大小超过本轮新增上限，跳过")
+            continue
         if downloading_gb + known_added_gb + metadata["size_gb"] > buffer_limit + 1e-9:
             print(f"      #{candidate['id']} 实际大小超过剩余下载缓冲，跳过")
             continue

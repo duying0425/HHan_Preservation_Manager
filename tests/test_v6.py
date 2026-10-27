@@ -307,4 +307,11 @@ class V6Tests(unittest.TestCase):
         self.assertEqual(records[0]["last_settlement_time"],"2026-10-27 00:00")
         self.assertEqual(records[0]["today_qualified"],"未达标")
 
+    def test_batch_limit_uses_actual_sizes(self):
+        core.CONFIG.update({"max_batch_download_gb":30,"max_downloading_space_gb":100})
+        session=Session()
+        with patch.object(core,"curl_download_torrent",side_effect=[torrent_bytes(20),torrent_bytes(20).replace(b"4:test",b"5:test2")]):
+            core.execute_actions(session,[candidate("1",size=10),candidate("2",size=10)],[])
+        self.assertEqual(sum(url.endswith("/add") for url,_ in session.posts),1)
+
 if __name__=="__main__": unittest.main()
