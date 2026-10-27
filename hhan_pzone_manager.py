@@ -1,75 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""HHanClub preservation manager V5.
+"""V6: completed-torrent quota, bounded-loss space optimization and download buffer.
 
-V5 keeps the V4 cache/qB execution engine in hhan_pzone_core.py and replaces the
-portfolio layer with a points-cap-aware policy:
-
-- Keep user_preservation_cache.json reconciliation and manual hard protection.
-- Preserve the existing HHan-oriented size/age/seeder proxy for comparing items.
-- Observe HHan's base seeding points and rescue-zone settlement points when the
-  site pages are available.
-- Respect the documented daily caps (base 1200, rescue extra 1800).
-- When rescue points are already near the cap, stop replacement churn; only use
-  genuinely free quota space (or release quota if already over 4 TB).
-- When below the cap, use the current rescue settlement to locally calibrate the
-  proxy and stop a batch once the configured cap target is reached.
-
-The generic NexusPHP B(A) parameters are intentionally NOT hard-coded as HHan
-parameters because HHan's current public pages do not expose a complete set of
-single-torrent formula parameters reliably. This avoids false precision.
+The score remains a comparison proxy, not an exact HHan points prediction.
+No settlement-day calibration, daily batch limit or midnight scheduler is used.
 """
-
-import math
 import re
-
 import hhan_pzone_core as core
 
-
-V5_DEFAULTS = {
+V6_DEFAULTS = {
     "base_points_daily_cap": 1200.0,
     "rescue_points_daily_cap": 1800.0,
     "points_cap_guard_ratio": 0.99,
     "freeze_replacements_at_rescue_cap": True,
-    "allow_free_space_downloads_at_cap": True,
-    "min_replacement_gain_ratio": 0.02,
+    "allow_free_space_downloads_at_cap": False,
     "score_age_t0_weeks": 8.0,
     "score_seeder_n0": 10.0,
 }
-for _key, _value in V5_DEFAULTS.items():
+for _key, _value in V6_DEFAULTS.items():
     core.CONFIG.setdefault(_key, _value)
-core.CACHE_VERSION = 5
-
-
+core.CACHE_VERSION = 6
 LAST_SITE_POINTS = {}
 
 
 def calc_preservation_metrics(size_gb, age_weeks, curr_seeders, init_seeders):
-    """Return the comparison proxy used to rank preservation items."""
-    size_gb = max(0.0, core.safe_float(size_gb))
-    age_weeks = max(0.1, core.safe_float(age_weeks, 0.1))
-    curr_seeders = max(1, core.safe_int(curr_seeders, 1))
-    init_seeders = core.safe_int(init_seeders)
-
-    t0 = max(0.1, core.safe_float(core.CONFIG.get("score_age_t0_weeks"), 8.0))
-    n0 = max(1.01, core.safe_float(core.CONFIG.get("score_seeder_n0"), 10.0))
-
-    time_factor = 1.0 - math.pow(10.0, -age_weeks / t0)
-    seeder_factor = 1.0 + math.sqrt(2.0) * math.pow(
-        10.0, -max(0.0, curr_seeders - 1.0) / (n0 - 1.0)
-    )
-    multiplier = core.preservation_multiplier(init_seeders)
-    value_per_gb = time_factor * seeder_factor * multiplier
-    portfolio_value = size_gb * value_per_gb
-    dpi = 1.0 / max(1e-12, value_per_gb)
-    return {
-        "time_factor": time_factor,
-        "seeder_factor": seeder_factor,
-        "multiplier": multiplier,
-        "value_per_gb": value_per_gb,
-        "portfolio_value": portfolio_value,
-        "dpi": dpi,
-    }
+    return core.calc_preservation_metrics(size_gb, age_weeks, curr_seeders, init_seeders)
 
 
 def _parse_number(text):
@@ -230,482 +185,184 @@ def fetch_site_points_snapshot():
     }
 
 
+def tier_label(init_seeders):
+    n = core.safe_int(init_seeders)
+    return "1人" if n == 1 else "2–3人" if 2 <= n <= 3 else "4–5人" if 4 <= n <= 5 else "未知/其他"
+
+
 def _candidate_to_item(candidate):
-    key = f"new:{candidate['id']}"
-    return {
-        "key": key,
-        "source": "new",
-        "id": candidate["id"],
-        "title": candidate["title"],
-        "name": candidate["title"],
-        "size_gb": core.safe_float(candidate["size_gb"]),
-        "init_seeders": core.safe_int(candidate["seeders"]),
-        "curr_seeders": core.safe_int(candidate["seeders"]),
-        "age_weeks": core.safe_float(candidate.get("age_weeks"), 16.0),
-        "value_per_gb": core.safe_float(candidate["value_per_gb"]),
-        "portfolio_value": core.safe_float(candidate["portfolio_value"]),
-        "protected": False,
-    }
+    n = core.safe_int(candidate["seeders"])
+    metrics = calc_preservation_metrics(candidate["size_gb"], candidate.get("age_weeks"), n, n)
+    return {"key": f"new:{candidate['id']}", "source": "new", "id": candidate["id"],
+            "title": candidate["title"], "name": candidate["title"],
+            "size_gb": core.safe_float(candidate["size_gb"]), "init_seeders": n,
+            "curr_seeders": n, "protected": False, **metrics}
 
 
-def _delete_payload(item):
-    return {
-        "hash": item["hash"],
-        "name": item["name"],
-        "size_gb": round(core.safe_float(item["size_gb"]), 3),
-        "init_seeders": core.safe_int(item.get("init_seeders")),
-        "curr_seeders": core.safe_int(item.get("curr_seeders")),
-        "value_per_gb": round(core.safe_float(item.get("value_per_gb")), 6),
-        "portfolio_value": round(core.safe_float(item.get("portfolio_value")), 6),
-        "reason": "不在4TB目标组合",
-    }
+def _delete_payload(item, reason="SPACE"):
+    result = {k: item[k] for k in ("hash", "name", "size_gb", "init_seeders", "curr_seeders", "value_per_gb", "portfolio_value")}
+    result["reason"] = reason
+    return result
 
 
 def _select_deletions(items, required_gb):
-    ordered = sorted(
-        items,
-        key=lambda x: (
-            core.safe_float(x.get("value_per_gb")),
-            -core.safe_float(x.get("size_gb")),
-        ),
-    )
-    selected = []
-    selected_gb = 0.0
-    for item in ordered:
-        if selected_gb + 1e-9 >= required_gb:
+    selected, released = [], 0.0
+    for item in sorted(items, key=lambda x: (x["value_per_gb"], -x.get("curr_seeders", 0), -x["size_gb"])):
+        if released + 1e-9 >= required_gb:
             break
         selected.append(item)
-        selected_gb += core.safe_float(item.get("size_gb"))
-    return selected, selected_gb
+        released += item["size_gb"]
+    return selected, released
 
 
-def _free_space_new_items(new_items, free_gb):
-    batch_gb = max(
-        0.0, core.safe_float(core.CONFIG.get("max_batch_download_gb"), 200.0)
-    )
-    batch_count = max(
-        0, core.safe_int(core.CONFIG.get("max_batch_download_count"), 10)
-    )
-    capacity = min(max(0.0, free_gb), batch_gb)
-    if capacity <= 0 or batch_count <= 0:
-        return []
-
-    chosen = core.knapsack_select(
-        new_items,
-        capacity,
-        core.safe_float(core.CONFIG.get("portfolio_unit_gb"), 0.1),
-    )
-    chosen.sort(
-        key=lambda x: (
-            core.safe_float(x.get("value_per_gb")),
-            core.safe_float(x.get("portfolio_value")),
-        ),
-        reverse=True,
-    )
-    if len(chosen) > batch_count:
-        chosen = chosen[:batch_count]
-
-    used = sum(core.safe_float(x.get("size_gb")) for x in chosen)
-    chosen_keys = {x["key"] for x in chosen}
-    for item in sorted(
-        new_items,
-        key=lambda x: core.safe_float(x.get("value_per_gb")),
-        reverse=True,
-    ):
-        if len(chosen) >= batch_count:
-            break
-        if item["key"] in chosen_keys:
-            continue
-        size = core.safe_float(item.get("size_gb"))
-        if used + size <= capacity + 1e-9:
-            chosen.append(item)
-            chosen_keys.add(item["key"])
-            used += size
-    return chosen
-
-
-def _predicted_rescue_points(current_proxy, planned_proxy, snapshot):
-    observed = snapshot.get("rescue_day")
-    cap = core.safe_float(snapshot.get("rescue_cap"))
-    if observed is None or current_proxy <= 0:
+def _minimum_portfolio(protected, optional, capacity, floor):
+    protected_gb = sum(x["size_gb"] for x in protected)
+    protected_value = sum(x["portfolio_value"] for x in protected)
+    if protected_gb > capacity + 1e-9:
         return None
-    if snapshot.get("rescue_near_cap"):
-        return (
-            min(core.safe_float(observed), cap)
-            if cap > 0
-            else core.safe_float(observed)
-        )
-    ratio = core.safe_float(observed) / current_proxy
-    predicted = max(0.0, planned_proxy * ratio)
-    return min(predicted, cap) if cap > 0 else predicted
+    target = max(0.0, floor-protected_value)
+    if target <= 1e-9:
+        return list(protected)
+    # Existing items win exact ties; among them, retain lower current seeder counts.
+    ordered = sorted(optional, key=lambda x: (x.get("source") == "new", x.get("curr_seeders", 0)))
+    selected = core.knapsack_select(ordered, capacity-protected_gb,
+                                   core.CONFIG.get("portfolio_unit_gb", 0.1), target_value=target)
+    result = list(protected) + selected
+    if sum(x["portfolio_value"] for x in result) < floor - 1e-6:
+        return None
+    return result
 
 
-def _plan_batch(
-    batch_items, current_keep_gb, current_proxy, deletable_existing, max_space
-):
-    download_gb = sum(core.safe_float(x.get("size_gb")) for x in batch_items)
-    overflow = max(0.0, current_keep_gb + download_gb - max_space)
-    deleted, deleted_gb = _select_deletions(deletable_existing, overflow)
-    deleted_value = sum(
-        core.safe_float(x.get("portfolio_value")) for x in deleted
-    )
-    new_value = sum(core.safe_float(x.get("portfolio_value")) for x in batch_items)
-    planned_proxy = current_proxy + new_value - deleted_value
-    return download_gb, deleted, deleted_gb, planned_proxy, overflow
+def _batch_candidates(items, capacity):
+    capacity = min(max(0.0, capacity), core.safe_float(core.CONFIG["max_batch_download_gb"]))
+    count = max(0, core.safe_int(core.CONFIG["max_batch_download_count"]))
+    if not count or capacity <= 0:
+        return []
+    selected = core.knapsack_select(items, capacity, core.CONFIG.get("portfolio_unit_gb", 0.1))
+    return sorted(selected, key=lambda x: (x["value_per_gb"], x["portfolio_value"]), reverse=True)[:count]
 
 
 def generate_strategy(candidates, current_keep_gb, current_items):
     global LAST_SITE_POINTS
-
-    print("[3/4] 正在执行 V5 积分上限感知的 4TB 组合优化...")
+    print("[3/4] V6 已完成组合与空间优化...")
     snapshot = fetch_site_points_snapshot()
     LAST_SITE_POINTS = snapshot
-
-    max_space = core.safe_float(core.CONFIG["max_preservation_space_gb"])
-    unit_gb = core.safe_float(core.CONFIG.get("portfolio_unit_gb"), 0.1)
+    context = core.LAST_PORTFOLIO_CONTEXT
+    state = dict(context.get("strategy_state", {}))
+    quota = core.safe_float(core.CONFIG["max_preservation_space_gb"])
+    downloading_gb = core.safe_float(context.get("downloading_gb"))
+    buffer_limit = core.safe_float(core.CONFIG["max_downloading_space_gb"])
+    buffer_free = max(0.0, buffer_limit-downloading_gb)
+    current_value = sum(x["portfolio_value"] for x in current_items)
+    configured_reference = core.safe_float(core.CONFIG.get("space_reward_reference_value"))
+    reference = configured_reference or (core.safe_float(state.get("reference_value")) if state.get("space_optimized") else max(current_value, core.safe_float(state.get("reference_value"))))
+    if reference <= 0:
+        reference = current_value
+    floor = reference * (1.0-core.safe_float(core.CONFIG["space_reward_loss_ratio"]))
+    state.update({"model_version": 6, "reference_value": reference})
+    at_cap = bool(snapshot.get("rescue_near_cap")) and bool(core.CONFIG.get("freeze_replacements_at_rescue_cap", True))
+    # Growth ends once a completed portfolio is established, or points reach the cap.
+    # The persisted flag prevents space recovered by compression being blindly refilled.
+    space_mode = bool(state.get("space_optimized")) or at_cap or (quota > 0 and current_keep_gb >= quota * core.safe_float(core.CONFIG["space_optimization_start_ratio"]))
     protected = [x for x in current_items if x.get("protected")]
-    optional_existing = [x for x in current_items if not x.get("protected")]
-    protected_gb = sum(core.safe_float(x.get("size_gb")) for x in protected)
-    current_proxy = sum(
-        core.safe_float(x.get("portfolio_value")) for x in current_items
-    )
-
+    optional = [x for x in current_items if not x.get("protected")]
     new_items = [_candidate_to_item(c) for c in candidates]
-    candidate_lookup = {f"new:{c['id']}": c for c in candidates}
+    lookup = {str(c["id"]): c for c in candidates}
+    deleted, batch, reasons = [], [], []
+    mode = "GROW"
+    retained = list(current_items)
+    min_saving = core.safe_float(core.CONFIG["space_min_saving_gb"])
 
-    remaining = max(0.0, max_space - protected_gb)
-    selected_optional = core.knapsack_select(
-        optional_existing + new_items, remaining, unit_gb
-    )
-    full_target = protected + selected_optional
-    full_target_keys = {x["key"] for x in full_target}
-    target_new = [x for x in selected_optional if x["source"] == "new"]
-    excluded_existing = [
-        x for x in optional_existing if x["key"] not in full_target_keys
-    ]
-    target_new.sort(
-        key=lambda x: (
-            core.safe_float(x.get("value_per_gb")),
-            core.safe_float(x.get("portfolio_value")),
-        ),
-        reverse=True,
-    )
-
-    strategy_mode = "PROXY-OPTIMIZE"
-    suppression_reason = ""
-    batch_items = []
-    deleted_items = []
-    deleted_gb = 0.0
-    download_gb = 0.0
-    planned_proxy = current_proxy
-    overflow = max(0.0, current_keep_gb - max_space)
-
-    freeze_at_cap = bool(
-        core.CONFIG.get("freeze_replacements_at_rescue_cap", True)
-    )
-    at_rescue_cap = bool(snapshot.get("rescue_near_cap"))
-
-    if at_rescue_cap and freeze_at_cap:
-        strategy_mode = "CAP-GUARD"
-        if current_keep_gb > max_space + 1e-9:
-            deleted_items, deleted_gb = _select_deletions(
-                optional_existing, current_keep_gb - max_space
-            )
-            planned_proxy -= sum(
-                core.safe_float(x.get("portfolio_value")) for x in deleted_items
-            )
-            suppression_reason = (
-                "保种积分已接近上限，仅释放超额配额，不做收益型换种"
-            )
-        elif bool(core.CONFIG.get("allow_free_space_downloads_at_cap", True)):
-            free_gb = max(0.0, max_space - current_keep_gb)
-            batch_items = _free_space_new_items(new_items, free_gb)
-            download_gb = sum(
-                core.safe_float(x.get("size_gb")) for x in batch_items
-            )
-            planned_proxy += sum(
-                core.safe_float(x.get("portfolio_value")) for x in batch_items
-            )
-            suppression_reason = (
-                "保种积分已接近上限，不淘汰旧种；仅使用真实空闲配额"
-            )
+    if current_keep_gb > quota + 1e-9:
+        mode = "OVERQUOTA"
+        deleted, _ = _select_deletions(optional, current_keep_gb-quota)
+        reasons.append("已完成任务超配额：本轮只释放、不新增；配额恢复优先于收益降幅")
+        removed = {x["key"] for x in deleted}
+        retained = [x for x in current_items if x["key"] not in removed]
+    elif space_mode:
+        mode = "SPACE-OPTIMIZE"
+        state["space_optimized"] = True
+        target = _minimum_portfolio(protected, optional, quota, floor)
+        if target is not None and current_keep_gb-sum(x["size_gb"] for x in target) >= min_saving-1e-9:
+            keys = {x["key"] for x in target}
+            deleted = [x for x in optional if x["key"] not in keys]
+            retained = target
         else:
-            suppression_reason = "保种积分已接近上限，冻结新增与换种"
+            reasons.append("当前组合没有同时满足收益下限和最小节省空间的清退方案")
+        retained_gb = sum(x["size_gb"] for x in retained)
+        # Only completed torrents back today's deletion plan. New downloads are a
+        # look-ahead opportunity and never contribute to current/planned value.
+        if context.get("downloading_count", 0):
+            reasons.append("已有下载/待确认任务：等待完成后再规划下一批空间置换")
+        elif buffer_free <= 0:
+            reasons.append("下载缓冲已满")
+        elif new_items:
+            future = _minimum_portfolio(protected, optional + new_items,
+                                        max(0.0, retained_gb-min_saving), floor)
+            if future is not None:
+                wanted = [x for x in future if x.get("source") == "new"]
+                batch = _batch_candidates(wanted, buffer_free)
+                if not batch:
+                    reasons.append("候选无法装入本轮下载缓冲或单批上限")
+            else:
+                reasons.append("候选不能在收益下限内进一步减少空间")
+        if at_cap:
+            reasons.append("CAP-GUARD：停止扩仓；允许收益约束内的空间压缩")
     else:
-        batch_gb_limit = max(
-            0.0,
-            core.safe_float(core.CONFIG.get("max_batch_download_gb"), 200.0),
-        )
-        batch_count_limit = max(
-            0, core.safe_int(core.CONFIG.get("max_batch_download_count"), 10)
-        )
-        used = 0.0
-        for item in target_new:
-            if len(batch_items) >= batch_count_limit:
-                break
-            size = core.safe_float(item.get("size_gb"))
-            if used + size <= batch_gb_limit + 1e-9:
-                batch_items.append(item)
-                used += size
-
-        (
-            download_gb,
-            deleted_items,
-            deleted_gb,
-            planned_proxy,
-            overflow,
-        ) = _plan_batch(
-            batch_items,
-            current_keep_gb,
-            current_proxy,
-            excluded_existing,
-            max_space,
-        )
-
-        predicted = _predicted_rescue_points(
-            current_proxy, planned_proxy, snapshot
-        )
-        rescue_cap = core.safe_float(snapshot.get("rescue_cap"))
-        target_points = rescue_cap * core.safe_float(
-            snapshot.get("guard_ratio"), 0.99
-        )
-
-        if (
-            predicted is not None
-            and rescue_cap > 0
-            and predicted >= target_points
-        ):
-            strategy_mode = "CAP-TARGET"
-            while batch_items:
-                test_batch = batch_items[:-1]
-                (
-                    t_download,
-                    t_deleted,
-                    t_deleted_gb,
-                    t_proxy,
-                    t_overflow,
-                ) = _plan_batch(
-                    test_batch,
-                    current_keep_gb,
-                    current_proxy,
-                    excluded_existing,
-                    max_space,
-                )
-                t_predicted = _predicted_rescue_points(
-                    current_proxy, t_proxy, snapshot
-                )
-                if t_predicted is None or t_predicted < target_points:
-                    break
-                batch_items = test_batch
-                download_gb = t_download
-                deleted_items = t_deleted
-                deleted_gb = t_deleted_gb
-                planned_proxy = t_proxy
-                overflow = t_overflow
-
-        min_gain = max(
-            0.0,
-            core.safe_float(core.CONFIG.get("min_replacement_gain_ratio"), 0.02),
-        )
-        gain_ratio = (planned_proxy - current_proxy) / max(current_proxy, 1e-12)
-        if (
-            deleted_items
-            and gain_ratio < min_gain
-            and current_keep_gb <= max_space + 1e-9
-        ):
-            strategy_mode = "CHURN-GUARD"
-            suppression_reason = (
-                f"预计代理收益仅提升 {gain_ratio * 100:.2f}% ，"
-                f"低于换种阈值 {min_gain * 100:.2f}%"
-            )
-            free_gb = max(0.0, max_space - current_keep_gb)
-            batch_items = _free_space_new_items(new_items, free_gb)
-            download_gb = sum(
-                core.safe_float(x.get("size_gb")) for x in batch_items
-            )
-            deleted_items = []
-            deleted_gb = 0.0
-            overflow = 0.0
-            planned_proxy = current_proxy + sum(
-                core.safe_float(x.get("portfolio_value")) for x in batch_items
-            )
-
-    to_download = [candidate_lookup[x["key"]] for x in batch_items]
-    to_mark_delete = [_delete_payload(x) for x in deleted_items]
-
-    predicted_rescue_after = _predicted_rescue_points(
-        current_proxy, planned_proxy, snapshot
-    )
-    predicted_total_after = None
-    if snapshot.get("base_day") is not None or predicted_rescue_after is not None:
-        predicted_total_after = (snapshot.get("base_day") or 0.0) + (
-            predicted_rescue_after or 0.0
-        )
-
-    full_target_value = sum(
-        core.safe_float(x.get("portfolio_value")) for x in full_target
-    )
-    stats = {
-        "protected_count": len(protected),
-        "protected_gb": protected_gb,
-        "target_count": len(full_target),
-        "target_existing_count": sum(
-            1 for x in full_target if x["source"] == "existing"
-        ),
-        "target_new_count": sum(1 for x in full_target if x["source"] == "new"),
-        "target_space_gb": sum(
-            core.safe_float(x.get("size_gb")) for x in full_target
-        ),
-        "current_value": current_proxy,
-        "target_value": full_target_value,
-        "value_gain": full_target_value - current_proxy,
-        "planned_value": planned_proxy,
-        "planned_value_gain": planned_proxy - current_proxy,
-        "unit_gb": unit_gb,
-        "unresolved_overflow_gb": max(0.0, overflow - deleted_gb),
-        "strategy_mode": strategy_mode,
-        "suppression_reason": suppression_reason,
-        "site_points": snapshot,
-        "predicted_rescue_after": predicted_rescue_after,
-        "predicted_total_after": predicted_total_after,
-    }
-    return (
-        to_download,
-        download_gb,
-        to_mark_delete,
-        deleted_gb,
-        current_keep_gb + download_gb,
-        stats,
-    )
+        growth_free = max(0.0, quota-current_keep_gb-downloading_gb)
+        batch = _batch_candidates(new_items, min(growth_free, buffer_free))
+        if not batch:
+            reasons.append("没有可装入剩余配额、下载缓冲及单批上限的候选")
+    planned_value = sum(x["portfolio_value"] for x in retained)
+    marked_gb = sum(x["size_gb"] for x in deleted)
+    dl_gb = sum(x["size_gb"] for x in batch)
+    core.LAST_STRATEGY_CONTEXT = {
+        "strategy_state": state, "value_floor": floor,
+        "completed_hashes": [str(x["hash"]).lower() for x in current_items]}
+    stats = {"strategy_mode": mode, "suppression_reason": "；".join(reasons),
+             "site_points": snapshot, "current_value": current_value, "planned_value": planned_value,
+             "planned_value_gain": planned_value-current_value, "reference_value": reference,
+             "value_floor": floor, "protected_count": len(protected),
+             "protected_gb": sum(x["size_gb"] for x in protected),
+             "downloading_gb": downloading_gb, "downloading_count": context.get("downloading_count", 0),
+             "unresolved_overflow_gb": max(0.0, current_keep_gb-marked_gb-quota),
+             "completed_items": current_items}
+    return ([lookup[str(x["id"])] for x in batch], dl_gb,
+            [_delete_payload(x, "OVERQUOTA" if mode == "OVERQUOTA" else "SPACE") for x in deleted],
+            marked_gb, current_keep_gb+dl_gb, stats)
 
 
-def _fmt_points(value, cap):
-    if value is None:
-        return "未解析"
-    if cap and cap > 0:
-        return f"{value:.2f} / {cap:.0f} /天"
-    return f"{value:.2f} /天"
+def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb,
+                          current_keep_gb, zone_stats, portfolio_stats,
+                          unmatched_count, cache_stats, dry_run):
+    stats = portfolio_stats
+    print("\n" + "="*90)
+    print(f"HHan V6 [{'DRY-RUN' if dry_run else 'EXECUTE'}] {stats['strategy_mode']}")
+    print(f"已完成配额 {current_keep_gb:.2f} -> {current_keep_gb-marked_gb:.2f} / {core.CONFIG['max_preservation_space_gb']:.2f} GB")
+    print(f"下载预留 {stats['downloading_gb']:.2f} + {download_gb:.2f} / {core.CONFIG['max_downloading_space_gb']:.2f} GB（完整大小；不计收益）")
+    print(f"代理值 {stats['current_value']:.2f} -> {stats['planned_value']:.2f}；固定参考基准 {stats['reference_value']:.2f}；下限 {stats['value_floor']:.2f}")
+    print(f"硬保护 {stats['protected_count']} 个 / {stats['protected_gb']:.2f} GB；元数据未知 {unmatched_count} 个")
+    print(f"站点最近保种结算：{stats['site_points'].get('rescue_day')}（仅观测及封顶保护；不反推当前组合收益）")
+    if stats['suppression_reason']:
+        print(f"判断说明：{stats['suppression_reason']}")
+    print(f"候选 {zone_stats['eligible_count']} 个；已有/重复过滤 {zone_stats['already_have']} 个")
+    deleted_hashes = {x['hash'] for x in to_mark_delete}
+    print("\n已完成任务（档位由 init 确定）：")
+    for item in stats['completed_items']:
+        action = '待清退' if item['hash'] in deleted_hashes else '保留'
+        print(f"  {action} | 档位 {tier_label(item['init_seeders'])} | {item['size_gb']:.2f} GB | init={item['init_seeders']} curr={item['curr_seeders']} | 代理 {item['portfolio_value']:.2f} | {item['name']}" + (f" | {item['protect_reason']}" if item.get('protected') else ''))
+    print(f"\n新增 {len(to_download)} 个 / {download_gb:.2f} GB：")
+    for item in to_download:
+        print(f"  #{item['id']} | 档位 {tier_label(item['seeders'])}（下载时估计，远端档案校正） | {item['size_gb']:.2f} GB | {item['title']}")
+    print(f"转为【{core.CONFIG['category_del']}】{len(to_mark_delete)} 个 / {marked_gb:.2f} GB；分类变更不会立即释放磁盘空间。")
+    if stats['unresolved_overflow_gb'] > 1e-6:
+        print(f"仍超配额 {stats['unresolved_overflow_gb']:.2f} GB：受硬保护限制，需人工处理。")
+    print("10% 默认降幅约束比较模型；不保证站点实际积分同比例变化。下载中异常任务由用户处理。")
+    print("="*90)
 
 
-def print_strategy_report(
-    to_download,
-    download_gb,
-    to_mark_delete,
-    marked_gb,
-    current_keep_gb,
-    zone_stats,
-    portfolio_stats,
-    unmatched_count,
-    cache_stats,
-    dry_run,
-):
-    max_space = core.safe_float(core.CONFIG["max_preservation_space_gb"])
-    mode = "DRY-RUN" if dry_run else "EXECUTE"
-    points = portfolio_stats.get("site_points", {})
-
-    print("\n" + "=" * 100)
-    print(f"HHanClub 保种区 V5 策略报告 [{mode}]")
-    print("=" * 100)
-    print(
-        f"缓存: {cache_stats['cache_records']} 条 | 当前保种 {cache_stats['active_keep']} | "
-        f"{'本轮自动重建 | ' if cache_stats.get('cache_rebuilt') else ''}"
-        f"远端刷新 {'是' if cache_stats['remote_refreshed'] else '否'}"
-    )
-    print(
-        f"站点积分观测: 基础 "
-        f"{_fmt_points(points.get('base_day_raw'), points.get('base_cap'))} | "
-        f"保种区最近结算 "
-        f"{_fmt_points(points.get('rescue_day'), points.get('rescue_cap'))}"
-    )
-    if (
-        points.get("base_day_raw") is not None
-        and points.get("rescue_day") is not None
-    ):
-        total_cap = core.safe_float(points.get("base_cap")) + core.safe_float(
-            points.get("rescue_cap")
-        )
-        observed_total = min(
-            core.safe_float(points.get("base_day_raw")),
-            core.safe_float(points.get("base_cap")),
-        ) + min(
-            core.safe_float(points.get("rescue_day")),
-            core.safe_float(points.get("rescue_cap")),
-        )
-        print(f"               合计 {observed_total:.2f} / {total_cap:.0f} /天")
-
-    print(
-        f"策略模式: {portfolio_stats.get('strategy_mode', '-')} | "
-        f"保种代理值 {portfolio_stats['current_value']:.2f} -> "
-        f"{portfolio_stats['planned_value']:.2f} "
-        f"(Δ {portfolio_stats['planned_value_gain']:+.2f})"
-    )
-    if portfolio_stats.get("predicted_rescue_after") is not None:
-        print(
-            f"预计本轮后保种积分: "
-            f"{portfolio_stats['predicted_rescue_after']:.2f} / "
-            f"{core.safe_float(points.get('rescue_cap')):.0f} /天"
-        )
-    if portfolio_stats.get("suppression_reason"):
-        print(f"换种抑制: {portfolio_stats['suppression_reason']}")
-
-    print(
-        f"保种区候选: {zone_stats['total_in_zone']} 个 | "
-        f"已有 {zone_stats['already_have']} | 0人 {zone_stats['dead_count']} | "
-        f"超人数阈值 {zone_stats['crowded_count']} | "
-        f"超体积阈值 {zone_stats['huge_count']} | "
-        f"合格 {zone_stats['eligible_count']}"
-    )
-    print(
-        f"当前【{core.CONFIG['category_keep']}】专项配额: "
-        f"{current_keep_gb:.2f} / {max_space:.2f} GB "
-        f"({current_keep_gb / 1024.0:.2f} TB)"
-    )
-    print(
-        f"硬保护: {portfolio_stats['protected_count']} 个 / "
-        f"{portfolio_stats['protected_gb']:.2f} GB | "
-        f"action=7元数据未知: {unmatched_count} 个"
-    )
-
-    print(f"\n[+] 本轮新增: {len(to_download)} 个 / {download_gb:.2f} GB")
-    for idx, item in enumerate(to_download, 1):
-        print(
-            f"  {idx:>2}. {item['size_gb']:>7.2f} GB | "
-            f"init={item['seeders']} curr={item['seeders']} | "
-            f"代理/GB {item['value_per_gb']:.3f} | {item['title']}"
-        )
-
-    print(
-        f"\n[-] 本轮退出【{core.CONFIG['category_keep']}】: "
-        f"{len(to_mark_delete)} 个 / {marked_gb:.2f} GB"
-    )
-    for idx, item in enumerate(to_mark_delete, 1):
-        print(
-            f"  {idx:>2}. {item['size_gb']:>7.2f} GB | "
-            f"init={item['init_seeders']} curr={item['curr_seeders']} | "
-            f"代理/GB {item['value_per_gb']:.3f} | {item['name']}"
-        )
-
-    final_estimate = current_keep_gb + download_gb - marked_gb
-    print(
-        f"\n本轮执行后预计专项配额: "
-        f"{final_estimate:.2f} GB / {max_space:.2f} GB"
-    )
-    if portfolio_stats["unresolved_overflow_gb"] > 0.01:
-        print(
-            f"⚠️ 仍有 {portfolio_stats['unresolved_overflow_gb']:.2f} GB 无法释放，"
-            "请检查硬保护项和未知元数据。"
-        )
-    print(
-        "说明: 基础1200/天与保种额外1800/天按站点观测做上限控制；"
-        "单种代理仅用于组合比较，不伪装成HHan精确单种积分。"
-    )
-    print("=" * 100 + "\n")
-
-
-core.calc_preservation_metrics = calc_preservation_metrics
 core.generate_strategy = generate_strategy
 core.print_strategy_report = print_strategy_report
-
 
 if __name__ == "__main__":
     core.main()

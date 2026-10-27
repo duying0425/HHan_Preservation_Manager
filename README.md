@@ -1,147 +1,102 @@
-# HHanClub 保种区自动化综合管理工具包
+# HHanClub 保种区自动化管理 V6
 
-V4：在固定 **保种专项配额** 下，将当前保种任务与新候选统一进行组合优化；同时使用持续更新的保种账本，自动维护当前状态。
+V6 分别管理已完成任务和下载预留，在收益代理值的可配置下限内减少空间占用。保留现有数据层、唯一主账本及手动恢复分类的方式。
 
-## 主要更新
+## 策略
 
-- 4TB 定义为 HHan `保种` 分类专项配额；
-- 使用 0/1 背包在容量约束下选择价值最高组合；
-- `user_preservation_cache.json` 作为唯一运行时主账本；
-- 每次运行自动与 qBittorrent 当前 HHan 任务对账；
-- 手动将“待删除”任务恢复为“保种”后，会自动重新进入组合优化；
-- 如果缓存文件不存在，会自动通过 HHan action=7 + 当前 qBittorrent 状态重建；
-- 支持独立缓存刷新任务，不下载、不修改分类。
+1. 已完成任务超过保种配额时，只释放、不新增。硬保护项除外，优先释放单位空间价值低的任务；同值时优先退出当前人数高的任务。
+2. 建仓期只用现有背包算法选择新候选补充空闲配额，不因尚未完成的新种清退老种。
+3. 已完成占用达到配额的 95%，或观测到保种结算接近封顶后，进入空间优化。该状态保存在账本中，防止下一轮把刚释放的空间盲目补满。
+4. 空间优化寻找满足代理值下限的较小组合；既可直接退出冗余老种，也可先下载更省空间的候选。候选未完成时不计收益；完成后，下一轮再根据完整组合评估老种清退。
+5. 取消必须跨档、逐对提升 10%、整体提升 2% 的硬门槛。不设置结算日限批、结算组合快照或零点调度。档位仍用于报告，并保留可配置的初始 1 人及未知元数据硬保护。
 
-## 文件
+收益代理模型保持“当前人数因子 × 初始人数保种倍率”的口径。时间因子只使用站点发布时间；没有发布时间按 1.0，旧账本中的完成时间和旧 age_weeks 不再充当发布时间。
 
-- `hhan_pzone_manager.py`：核心管理脚本
-- `config.example.json`：配置模板
-- `requirements.txt`：Python 依赖
-- `run.sh`：Linux / Synology NAS 入口
-- `run.bat`：Windows 入口
-- `run.ps1`：PowerShell 入口
+默认允许代理值比参考值下降 10%。自动参考值在建仓期随已完成组合提高，首次进入空间优化后固定；后续新旧任务临时重叠不会抬高参考值，每轮也不会重新对缩水后的组合打九折。也可配置固定参考值。代理值并非 HHan 精确积分，10% 约束不能保证实际结算恰好下降相同比例。
 
-运行数据：
+CAP-GUARD 用最近结算观测阻止继续扩仓，允许满足代理值下限的空间压缩。不再用“结算值 ÷ 当前组合”推算换后积分，也不把封顶观测解释为可精确计算的剩余收益。
 
-- `user_preservation_cache.json`：唯一主账本（不提交 Git）
+## 下载缓冲
 
-## 缓存账本机制
+默认已完成配额 4096 GB，全部下载中及提交待确认任务共用额外 250 GB 缓冲。这里的 GB 按 1024³ 字节计算。
 
-每次正常运行：
+- 下载中任务不进入收益和自动清退范围；异常任务由用户判断、删除。
+- 缓冲按任务完整大小预留，不按已下载字节计算，也不会每轮重新放宽。
+- 建仓期还会扣除已有下载预留，避免完成后无必要超配额。
+- 空间置换期间允许暂时同时保留新旧任务；存在下载/待确认任务时，不再规划下一批空间置换。
+- 将任务改为“待删除”只退出保种分类配额，文件仍占用磁盘；本工具不删除文件。
 
-```text
-user_preservation_cache.json
-        ↓
-检查 HHan action=7 远端数据是否超过刷新周期
-        ↓
-读取 qB 当前 HHan 任务
-        ↓
-更新 active / category / 当前人数 / 大小 / last_seen
-        ↓
-保存主账本
-        ↓
-执行组合优化
-```
+## 数据修复
 
-如果不存在缓存：
+- action=7 优先读取 maxpage/末页链接抓全；没有末页信息时读取至有效空页，并检测重复页。网络、登录或表结构错误不会作为空页，不会发布半份远端结果。
+- 主账本保存上次结算、今日做种、今日达标及观测时间；它们用于展示和后续核对，不驱动结算日调度。
+- qB 与账本优先按 hash、站点 torrent_id 对应；无法对应时从种子注释的本站详情链接补 ID。每个 hash 成功读取一次属性，临时请求失败可重试。
+- 相同 ID/hash 的重复记录合并；远端真实 init 优先，未知值不会覆盖已知值。
+- 新种提交前从原始 torrent info 编码计算 hash，支持 v1、v2 和混合种子，并读取准确大小。新任务大小不依赖 qB 立即回读。
+- 返回 Fails. 等异常结果时按 hash 核实：存在才视为已有；不存在则失败冷却，通信不确定则先预留空间等待确认。不会因为添加结果不确定而按新种收益清退老种。
+- 候选同时按名字及站点 ID 去重，包含已提交但尚未出现在 qB 列表中的任务。
 
-```text
-首次启动
-    ↓
-强制刷新 HHan action=7
-    ↓
-读取 qB 当前任务
-    ↓
-自动生成 user_preservation_cache.json
-```
+## 配置
 
-支持：
+把 config.example.json 复制为本地 config.json 后填写认证信息。已有 config.json 无须复制覆盖，新参数缺失时自动使用默认值。
 
-- 手动恢复“待删除”任务；
-- qB 任务状态变化自动同步；
-- 不依赖旧历史快照文件。
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| max_preservation_space_gb | 4096 | 已完成保种分类配额 |
+| max_downloading_space_gb | 250 | 全部下载/待确认任务的完整大小预留上限 |
+| space_reward_loss_ratio | 0.10 | 相对固定参考值的最大代理值降幅 |
+| space_reward_reference_value | 0 | 0 表示建仓后自动固定参考值；正数指定固定参考值 |
+| space_min_saving_gb | 5 | 一次空间优化至少节省的空间 |
+| space_optimization_start_ratio | 0.95 | 建仓转为空间优化的已完成配额比例 |
+| max_single_download_gb | 80 | 单种下载大小上限，提交前核对实际 torrent 大小 |
+| max_batch_download_gb | 200 | 单轮候选下载总量上限 |
+| max_batch_download_count | 10 | 单轮新增任务数上限 |
+| min_candidate_seeders / max_candidate_seeders | 1 / 3 | 候选当前人数范围 |
+| protect_init_one | true | 初始 1 人任务硬保护，开启时空间优化也不能清退 |
+| protect_unknown_records | true | 未恢复真实 init 的任务硬保护 |
+| portfolio_unit_gb | 0.1 | 背包容量离散粒度 |
+| add_retry_seconds | 600 | 添加失败冷却及待确认结果检查周期 |
+| cache_remote_refresh_hours | 24 | 远端档案刷新周期；小于等于 0 停止周期刷新 |
+| points_cap_guard_ratio | 0.99 | 最近保种结算接近封顶的判断比例 |
 
-## 单独刷新缓存
-
-只更新缓存，不下载、不修改分类：
-
-```bash
-python3 hhan_pzone_manager.py --refresh-cache
-```
-
-旧参数仍兼容：
-
-```bash
-python3 hhan_pzone_manager.py --sync
-```
-
-Synology 定时任务示例：
-
-```bash
-cd /volume2/homes/duyingfang/HHan_Preservation_Manager
-bash run.sh --refresh-cache
-```
-
-## 保种专项配额
-
-默认：
-
-```json
-"max_preservation_space_gb": 4096.0
-```
-
-仅约束 qBittorrent 中 HHan 且分类为 `保种` 的任务，不代表整块硬盘容量。
-
-## 组合优化
-
-```text
-当前保种任务 + 新候选
-          ↓
-统一计算 value_per_gb / portfolio_value
-          ↓
-4TB 容量约束下背包优化
-          ↓
-目标组合
-          ↓
-分批收敛
-```
-
-主要参数：
-
-| 参数 | 默认值 | 说明 |
-|-|-|-|
-| max_preservation_space_gb | 4096 | 保种专项配额 |
-| min_candidate_seeders | 1 | 候选最低人数 |
-| max_candidate_seeders | 3 | 候选最高人数 |
-| max_batch_download_gb | 200 | 单轮新增上限 |
-| max_batch_download_count | 10 | 单轮任务数上限 |
-| portfolio_unit_gb | 0.1 | 背包离散粒度 |
-| cache_remote_refresh_hours | 24 | HHan 远端档案刷新周期 |
+已有硬保护任务本身超配额时，工具报告无法释放的大小，由用户处理。强制恢复已完成配额可能突破代理值降幅下限；该情形优先恢复配额，并在报告中说明。
 
 ## 使用
 
-Dry Run：
+默认 dry-run：查询远端和 qB，生成报告，不提交新任务、不修改分类、配置或主账本。
 
 ```bash
 python3 hhan_pzone_manager.py
+python3 hhan_pzone_manager.py --set space_reward_loss_ratio=0.10 --set max_downloading_space_gb=300
 ```
 
-执行：
+--set 可重复使用，校验键名和类型，仅作用于本次 dry-run；不能与执行或刷新账本参数组合。
+
+实际执行：
 
 ```bash
 python3 hhan_pzone_manager.py --execute
 ```
 
-缓存刷新：
+仅刷新主账本，不下载、不改分类：
 
 ```bash
 python3 hhan_pzone_manager.py --refresh-cache
 ```
 
-## 安全
+--sync 兼容为 --refresh-cache。直接运行 hhan_pzone_core.py 也转入 V6 入口。
 
-以下文件不会提交：
+run.sh / run.ps1 / run.bat 保留现有启动方式；检查各自默认参数后使用。已有 PAUSE/STOP 标记应保持到完成 dry-run 核对后再由用户恢复定时任务。
 
-- config.json
-- 日志
-- 保种历史缓存
+## 文件和验证
+
+- hhan_pzone_manager.py：V6 策略、站点积分观测和逐种报告。
+- hhan_pzone_core.py：配置、采集、主账本、qB 对账及执行。
+- user_preservation_cache.json：唯一运行账本；旧 hhan_active_preservation.json 不再读取。
+- tests/test_v6.py：分页、身份恢复、缓冲、收益下限、只读 dry-run 和执行结果的回归测试。
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+config.json、凭据、主账本和运行日志不提交 Git。部署前应备份脚本与主账本，保持暂停标记，先运行测试及 dry-run，再按报告处理现有下载缓冲占用。
