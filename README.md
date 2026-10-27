@@ -40,7 +40,7 @@ CAP-GUARD 用最近结算观测阻止继续扩仓，允许满足代理值下限�
 
 ## 配置
 
-把 config.example.json 复制为本地 config.json 后填写认证信息。已有 config.json 无须复制覆盖，新参数缺失时自动使用默认值。
+首次使用时把 config.example.json 复制为本地 config.json 后填写认证信息。已有 config.json 只需补齐缺失参数，保留原有配额、批量上限和认证信息；新参数缺失时自动使用默认值。模板中的数值是通用默认值，不用于覆盖已有本地设置。
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
@@ -59,7 +59,14 @@ CAP-GUARD 用最近结算观测阻止继续扩仓，允许满足代理值下限�
 | portfolio_unit_gb | 0.1 | 背包容量离散粒度 |
 | add_retry_seconds | 600 | 添加失败冷却及待确认结果检查周期 |
 | cache_remote_refresh_hours | 24 | 远端档案刷新周期；小于等于 0 停止周期刷新 |
+| base_points_daily_cap | 1200 | 基础积分每日封顶的报告口径 |
+| rescue_points_daily_cap | 1800 | 保种额外积分每日封顶的观测口径，用于报告和 CAP-GUARD |
 | points_cap_guard_ratio | 0.99 | 最近保种结算接近封顶的判断比例 |
+| freeze_replacements_at_rescue_cap | true | 最近保种结算接近封顶时停止扩仓，允许收益约束内的空间压缩 |
+| score_age_t0_weeks | 8 | 收益代理模型的种龄时间常量，单位为周 |
+| score_seeder_n0 | 10 | 收益代理模型的当前人数衰减常量 |
+
+单轮新增量同时受剩余已完成配额、可用下载缓冲及批量上限约束；空间置换阶段使用额外下载缓冲，候选完成后再评估清退。当前策略不需要每日 18 小时达标参数；未被策略读取的 allow_free_space_downloads_at_cap 不加入配置模板。
 
 已有硬保护任务本身超配额时，工具报告无法释放的大小，由用户处理。强制恢复已完成配额可能突破代理值降幅下限；该情形优先恢复配额，并在报告中说明。
 
