@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """V6: completed-torrent quota, bounded-loss space optimization and download buffer.
 
-The score remains a comparison proxy, not an exact HHan points prediction.
-No settlement-day calibration, daily batch limit or midnight scheduler is used.
+Portfolio selection uses the V6 score and quota rules. Daily point forecasts
+reuse the V5 observation-based algorithm without an 18-hour qualification gate.
 """
 import re
 import hhan_pzone_core as core
@@ -185,6 +185,22 @@ def fetch_site_points_snapshot():
     }
 
 
+def _predicted_rescue_points(current_proxy, planned_proxy, snapshot):
+    observed = snapshot.get("rescue_day")
+    cap = core.safe_float(snapshot.get("rescue_cap"))
+    if observed is None or current_proxy <= 0:
+        return None
+    if snapshot.get("rescue_near_cap"):
+        return (
+            min(core.safe_float(observed), cap)
+            if cap > 0
+            else core.safe_float(observed)
+        )
+    ratio = core.safe_float(observed) / current_proxy
+    predicted = max(0.0, planned_proxy * ratio)
+    return min(predicted, cap) if cap > 0 else predicted
+
+
 def tier_label(init_seeders):
     n = core.safe_int(init_seeders)
     return "1人" if n == 1 else "2–3人" if 2 <= n <= 3 else "4–5人" if 4 <= n <= 5 else "未知/其他"
@@ -316,6 +332,14 @@ def generate_strategy(candidates, current_keep_gb, current_items):
     planned_value = sum(x["portfolio_value"] for x in retained)
     marked_gb = sum(x["size_gb"] for x in deleted)
     dl_gb = sum(x["size_gb"] for x in batch)
+    predicted_rescue_after = _predicted_rescue_points(current_value, planned_value, snapshot)
+    predicted_total_after = None
+    if snapshot.get("base_day") is not None or predicted_rescue_after is not None:
+        predicted_total_after = (snapshot.get("base_day") or 0.0) + (predicted_rescue_after or 0.0)
+    predicted_rescue_after_downloads = None
+    if batch:
+        future_value = planned_value + sum(x["portfolio_value"] for x in batch)
+        predicted_rescue_after_downloads = _predicted_rescue_points(current_value, future_value, snapshot)
     core.LAST_STRATEGY_CONTEXT = {
         "strategy_mode": mode, "strategy_state": state, "value_floor": floor,
         "completed_hashes": [str(x["hash"]).lower() for x in current_items]}
@@ -326,7 +350,10 @@ def generate_strategy(candidates, current_keep_gb, current_items):
              "protected_gb": sum(x["size_gb"] for x in protected),
              "downloading_gb": downloading_gb, "downloading_count": context.get("downloading_count", 0),
              "unresolved_overflow_gb": max(0.0, current_keep_gb-marked_gb-quota),
-             "completed_items": current_items}
+             "completed_items": current_items,
+             "predicted_rescue_after": predicted_rescue_after,
+             "predicted_total_after": predicted_total_after,
+             "predicted_rescue_after_downloads": predicted_rescue_after_downloads}
     return ([lookup[str(x["id"])] for x in batch], dl_gb,
             [_delete_payload(x, "OVERQUOTA" if mode == "OVERQUOTA" else "SPACE") for x in deleted],
             marked_gb, current_keep_gb+dl_gb, stats)
@@ -342,7 +369,19 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb,
     print(f"下载预留 {stats['downloading_gb']:.2f} + {download_gb:.2f} / {core.CONFIG['max_downloading_space_gb']:.2f} GB（完整大小；不计收益）")
     print(f"代理值 {stats['current_value']:.2f} -> {stats['planned_value']:.2f}；固定参考基准 {stats['reference_value']:.2f}；下限 {stats['value_floor']:.2f}")
     print(f"硬保护 {stats['protected_count']} 个 / {stats['protected_gb']:.2f} GB；元数据未知 {unmatched_count} 个")
-    print(f"站点最近保种结算：{stats['site_points'].get('rescue_day')}（仅观测及封顶保护；不反推当前组合收益）")
+    points = stats['site_points']
+    print(f"站点最近保种结算：{points.get('rescue_day')}（V5 预测输入）")
+    if points.get('base_day') is not None:
+        print(f"站点基础积分折算：{points['base_day']:.2f} / {core.safe_float(points.get('base_cap')):.0f} /天")
+    if stats['predicted_rescue_after'] is not None:
+        print(f"预计本轮后保种积分（V5算法）：{stats['predicted_rescue_after']:.2f} / {core.safe_float(points.get('rescue_cap')):.0f} /天")
+        if points.get('base_day') is not None:
+            total_cap = core.safe_float(points.get('base_cap')) + core.safe_float(points.get('rescue_cap'))
+            print(f"预计本轮后合计积分：{stats['predicted_total_after']:.2f} / {total_cap:.0f} /天")
+    else:
+        print("预计本轮后保种积分（V5算法）：不可用，缺少站点结算或当前组合评分")
+    if stats['predicted_rescue_after_downloads'] is not None:
+        print(f"本轮新增任务完成后预计保种积分（V5算法）：{stats['predicted_rescue_after_downloads']:.2f} / {core.safe_float(points.get('rescue_cap')):.0f} /天")
     if stats['suppression_reason']:
         print(f"判断说明：{stats['suppression_reason']}")
     print(f"候选 {zone_stats['eligible_count']} 个；已有/重复过滤 {zone_stats['already_have']} 个")
