@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 """HHanClub preservation-zone automation manager.
 
-V4 cache model:
+V6 data engine (backward-compatible ledger records):
 - user_preservation_cache.json is the only persistent ledger.
 - Every run reconciles the ledger against current qBittorrent HHan tasks.
 - Remote HHan action=7 history is refreshed automatically when stale.
 - If the cache file is missing, it is rebuilt automatically from action=7 + qB.
-- Current preservation torrents and new candidates use the same value model and a 0/1 knapsack.
+- Policy is provided by hhan_pzone_manager.py; downloading tasks have a separate space reservation.
 """
 
 import argparse
+import hashlib
+import html as html_module
 import json
 import math
 import os
@@ -21,6 +23,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 import requests
 import urllib3
@@ -37,7 +40,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(BASE_DIR, "user_preservation_cache.json")
-CACHE_VERSION = 4
+CACHE_VERSION = 6
+CACHE_READ_ONLY = False
+LAST_PORTFOLIO_CONTEXT = {}
+LAST_STRATEGY_CONTEXT = {}
 
 CONFIG = {
     "hhan_base_url": "https://hhanclub.net",
@@ -62,6 +68,12 @@ CONFIG = {
     "protect_init_one": True,
     "protect_unknown_records": True,
     "cache_remote_refresh_hours": 24.0,
+    "max_downloading_space_gb": 250.0,
+    "space_reward_loss_ratio": 0.10,
+    "space_reward_reference_value": 0.0,
+    "space_min_saving_gb": 5.0,
+    "space_optimization_start_ratio": 0.95,
+    "add_retry_seconds": 600.0,
 }
 
 
@@ -83,6 +95,7 @@ def parse_size_to_gb(text):
     value = float(m.group(1))
     unit = m.group(2).upper()
     factors = {
+        "B": 1.0 / (1024.0 ** 3),
         "KB": 1.0 / (1024.0 * 1024.0),
         "MB": 1.0 / 1024.0,
         "GB": 1.0,
@@ -105,8 +118,9 @@ def safe_int(value, default=0):
 
 def safe_float(value, default=0.0):
     try:
-        return float(value)
-    except Exception:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (ValueError, TypeError, OverflowError):
         return default
 
 
@@ -122,37 +136,29 @@ def preservation_multiplier(init_seeders):
 
 
 def calc_preservation_metrics(size_gb, age_weeks, curr_seeders, init_seeders):
+    """Comparison proxy: current swarm factor and locked initial multiplier."""
     size_gb = max(0.0, safe_float(size_gb))
-    age_weeks = max(0.1, safe_float(age_weeks, 0.1))
-    curr_seeders = max(1, safe_int(curr_seeders, 1))
-    init_seeders = safe_int(init_seeders)
-
-    time_factor = 1.0 - math.pow(10.0, -age_weeks / 8.0)
+    t0 = max(0.1, safe_float(CONFIG.get("score_age_t0_weeks"), 8.0))
+    n0 = max(1.01, safe_float(CONFIG.get("score_seeder_n0"), 10.0))
+    time_factor = (1.0 if age_weeks is None else
+                   1.0 - math.pow(10.0, -max(0.0, safe_float(age_weeks)) / t0))
     seeder_factor = 1.0 + math.sqrt(2.0) * math.pow(
-        10.0, -max(0.0, curr_seeders - 1.0) / 9.0
-    )
+        10.0, -max(0.0, safe_int(curr_seeders, 1) - 1.0) / (n0 - 1.0))
     multiplier = preservation_multiplier(init_seeders)
     value_per_gb = time_factor * seeder_factor * multiplier
-    portfolio_value = size_gb * value_per_gb
-    dpi = 1.0 / max(1e-12, value_per_gb)
-    return {
-        "time_factor": time_factor,
-        "seeder_factor": seeder_factor,
-        "multiplier": multiplier,
-        "value_per_gb": value_per_gb,
-        "portfolio_value": portfolio_value,
-        "dpi": dpi,
-    }
+    return {"time_factor": time_factor, "seeder_factor": seeder_factor,
+            "multiplier": multiplier, "value_per_gb": value_per_gb,
+            "portfolio_value": size_gb * value_per_gb,
+            "dpi": 1.0 / max(1e-12, value_per_gb)}
 
 
-def age_weeks_from_time(value, default=16.0):
+def age_weeks_from_time(value, default=None):
     if not value:
         return default
-    text = str(value).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            dt = datetime.strptime(text, fmt)
-            return max(0.1, (datetime.now() - dt).total_seconds() / 604800.0)
+            dt = datetime.strptime(str(value).strip(), fmt)
+            return max(0.0, (datetime.now() - dt).total_seconds() / 604800.0)
         except ValueError:
             pass
     return default
@@ -177,7 +183,7 @@ def curl_get_hhan(path, max_retries=3):
     cmd = [
         curl_bin,
         "--noproxy", "*",
-        "-s", "-k", "--compressed",
+        "-s", "-k", "--compressed", "--connect-timeout", "10", "--max-time", "45",
         "-H", f"User-Agent: {CONFIG['hhan_ua']}",
         "-H", f"Cookie: {CONFIG['hhan_cookie']}",
         url,
@@ -201,7 +207,7 @@ def curl_download_torrent(torrent_id, max_retries=3):
     cmd = [
         curl_bin,
         "--noproxy", "*",
-        "-s", "-k",
+        "-s", "-k", "--connect-timeout", "10", "--max-time", "45",
         "-H", f"User-Agent: {CONFIG['hhan_ua']}",
         "-H", f"Cookie: {CONFIG['hhan_cookie']}",
         url,
@@ -272,6 +278,8 @@ def load_cache():
 
 
 def save_cache(payload):
+    if CACHE_READ_ONLY:
+        return
     payload["version"] = CACHE_VERSION
     payload["updated_at"] = iso_now()
     payload.pop("legacy_migrated_at", None)
@@ -288,22 +296,21 @@ def record_match_score(record, *, torrent_id=None, torrent_hash=None, title=None
         return (0, 0.0)
     if torrent_id and str(record.get("torrent_id", "")) == str(torrent_id):
         return (1, 0.0)
-
+    # Known, contradictory IDs/hashes must never be joined by a similar name.
+    if torrent_id and record.get("torrent_id"):
+        return None
+    if torrent_hash and record.get("hash"):
+        return None
     if not title:
         return None
     a = normalize_name(record.get("title") or record.get("name") or "")
     b = normalize_name(title)
-    if not a or not b or not (a == b or a in b or b in a):
+    if not a or not b or not (a == b or (min(len(a), len(b)) > 12 and (a in b or b in a))):
         return None
-
-    rec_size = safe_float(record.get("size_gb"))
-    req_size = safe_float(size_gb)
-    if rec_size > 0 and req_size > 0:
-        delta = abs(rec_size - req_size) / max(rec_size, req_size)
-        if delta >= 0.05:
-            return None
-    else:
-        delta = 1.0
+    rec_size, req_size = safe_float(record.get("size_gb")), safe_float(size_gb)
+    delta = abs(rec_size - req_size) / max(rec_size, req_size) if rec_size > 0 and req_size > 0 else 1.0
+    if rec_size > 0 and req_size > 0 and delta >= 0.05:
+        return None
     return (2 if a == b else 3, delta)
 
 
@@ -319,58 +326,80 @@ def find_cache_record(records, **kwargs):
 
 
 def normalize_record_metrics(record):
-    size_gb = safe_float(record.get("size_gb"))
-    init_n = safe_int(record.get("init_seeders"))
-    curr_n = safe_int(record.get("curr_seeders"), 1)
-    age_weeks = safe_float(record.get("age_weeks"))
-    if age_weeks <= 0:
-        age_weeks = age_weeks_from_time(record.get("completed_time"), 16.0)
-    record["age_weeks"] = round(max(0.1, age_weeks), 3)
-    metrics = calc_preservation_metrics(size_gb, age_weeks, curr_n, init_n)
-    record["priority_score"] = round(metrics["dpi"], 6)
-    record["dpi"] = round(metrics["dpi"], 6)
+    # Legacy age_weeks/completed_time describe the local download, not publication.
+    age = age_weeks_from_time(record.get("published_time"))
+    record["age_weeks"] = round(age, 6) if age is not None else None
+    metrics = calc_preservation_metrics(record.get("size_gb"), age,
+                                        record.get("curr_seeders", 1), record.get("init_seeders"))
+    record["priority_score"] = record["dpi"] = round(metrics["dpi"], 6)
     record["value_per_gb"] = round(metrics["value_per_gb"], 6)
     record["portfolio_value"] = round(metrics["portfolio_value"], 6)
 
 
 def merge_record(records, source_record, source_name):
-    title = source_record.get("title") or source_record.get("name") or ""
-    torrent_id = source_record.get("torrent_id") or ""
-    torrent_hash = source_record.get("hash") or ""
-    size_gb = safe_float(source_record.get("size_gb"))
-    record = find_cache_record(
-        records,
-        torrent_id=torrent_id or None,
-        torrent_hash=torrent_hash or None,
-        title=title,
-        size_gb=size_gb,
-    )
+    record = find_cache_record(records, torrent_id=source_record.get("torrent_id") or None,
+        torrent_hash=source_record.get("hash") or None,
+        title=source_record.get("title") or source_record.get("name"),
+        size_gb=source_record.get("size_gb"))
     if record is None:
         record = {}
         records.append(record)
-
-    for field in ("torrent_id", "hash", "title", "name", "size_gb", "completed_time", "added_on"):
-        value = source_record.get(field)
-        if value not in (None, "", 0, 0.0):
-            record[field] = value
-
+    fields = ("torrent_id", "hash", "hash_v1", "hash_v2", "title", "name", "size_gb",
+              "completed_time", "published_time", "added_on", "last_settlement", "last_settlement_time",
+              "last_settlement_points", "today_seeding", "today_qualified", "remote_observed_at")
+    for field in fields:
+        if field in source_record and source_record[field] not in (None, ""):
+            record[field] = source_record[field]
     init_n = safe_int(source_record.get("init_seeders"))
-    if init_n > 0:
+    if init_n > 0 and (source_name == "remote_action7" or not (record.get("init_seeders_source") == "remote_action7" or record.get("source") == "remote_action7")):
         record["init_seeders"] = init_n
-
-    curr_n = safe_int(source_record.get("curr_seeders"))
-    if curr_n > 0:
-        record["curr_seeders"] = curr_n
-
-    age_weeks = safe_float(source_record.get("age_weeks"))
-    if age_weeks > 0:
-        record["age_weeks"] = age_weeks
-    elif source_record.get("completed_time") and safe_float(record.get("age_weeks")) <= 0:
-        record["age_weeks"] = age_weeks_from_time(source_record.get("completed_time"))
-
+        record["init_seeders_source"] = source_name
+    if "curr_seeders" in source_record:
+        record["curr_seeders"] = max(0, safe_int(source_record["curr_seeders"]))
     record["source"] = source_name
     normalize_record_metrics(record)
     return record
+
+
+def deduplicate_records(records):
+    """Join transitive ID/hash duplicates; official init wins, qB state is retained."""
+    groups = []
+    for item in records:
+        matches = [g for g in groups if
+                   (item.get("hash") and item.get("hash") in g["hashes"]) or
+                   (item.get("torrent_id") and str(item["torrent_id"]) in g["ids"])]
+        members = [item]
+        for group in matches:
+            members.extend(group["members"])
+            groups.remove(group)
+        groups.append({"members": members,
+                       "hashes": {x["hash"] for x in members if x.get("hash")},
+                       "ids": {str(x["torrent_id"]) for x in members if x.get("torrent_id")}})
+    result = []
+    for group in groups:
+        members = sorted(group["members"], key=lambda x: (
+            x.get("init_seeders_source") == "remote_action7" or x.get("source") == "remote_action7",
+            str(x.get("remote_observed_at") or x.get("last_seen") or "")))
+        merged = {}
+        for item in members:
+            for key, value in item.items():
+                if value is not None and value != "":
+                    if key == "init_seeders" and safe_int(value) <= 0:
+                        continue
+                    merged[key] = value
+        # Live qB identity/status takes precedence over stale remote records.
+        for item in sorted(members, key=lambda x: str(x.get("last_seen") or "")):
+            if item.get("present_in_qb"):
+                for key in ("hash", "title", "name", "category", "state", "progress", "active",
+                            "present_in_qb", "last_seen", "identity_lookup_checked", "add_status"):
+                    if key in item:
+                        merged[key] = item[key]
+        if any(safe_int(x.get("init_seeders")) > 0 and (x.get("source") == "remote_action7" or x.get("init_seeders_source") == "remote_action7") for x in members):
+            merged["init_seeders_source"] = "remote_action7"
+        normalize_record_metrics(merged)
+        result.append(merged)
+    records[:] = result
+    return records
 
 
 def remote_refresh_due(payload, force=False):
@@ -388,58 +417,92 @@ def remote_refresh_due(payload, force=False):
 def fetch_remote_preservation_records():
     uid = str(CONFIG.get("user_id", "") or "").strip()
     if not uid:
-        print("[缓存] user_id 未配置，跳过 HHan 远端档案刷新。")
+        print("[缓存] user_id 未配置，跳过远端刷新。")
         return []
+    print("[缓存] 正在完整读取 HHan action=7 档案...")
+    started, observed = datetime.now(), iso_now()
 
-    print("[缓存] 正在从 HHanClub action=7 刷新保种档案...")
-    started = datetime.now()
-
-    def parse_row(tds):
-        torrent_id = tds[0].get_text(strip=True)
-        title_a = tds[1].find("a")
-        title = title_a.get_text(strip=True) if title_a else tds[1].get_text(strip=True)
-        size_gb = parse_size_to_gb(tds[2].get_text(strip=True))
-        init_n = safe_int(tds[3].get_text(strip=True))
-        curr_n = safe_int(tds[4].get_text(strip=True))
-        completed_time = tds[5].get_text(strip=True)
-        age_weeks = age_weeks_from_time(completed_time)
-        return {
-            "torrent_id": torrent_id,
-            "title": title,
-            "name": title,
-            "size_gb": round(size_gb, 3),
-            "init_seeders": init_n,
-            "curr_seeders": curr_n,
-            "completed_time": completed_time,
-            "age_weeks": round(age_weeks, 3),
-        }
-
-    def fetch_page(page):
+    def read_page(page):
         html = curl_get_hhan(f"userdetails.php?action=7&id={uid}&page={page}")
         if not html:
-            return []
+            raise RuntimeError(f"action=7 第 {page} 页读取失败，保留原账本")
         soup = BeautifulSoup(html, "html.parser")
-        tables = soup.find_all("table")
-        if not tables:
-            return []
-        rows = []
-        for row in tables[0].find_all("tr")[1:]:
-            tds = row.find_all("td")
-            if len(tds) >= 6:
-                try:
-                    rows.append(parse_row(tds))
-                except Exception:
-                    pass
-        return rows
+        if soup.select_one('input[name="password"], #challenge-running, #cf-challenge-running'):
+            raise RuntimeError("action=7 需要重新登录或完成验证，保留原账本")
+        rows, valid_table = [], False
+        for table in soup.find_all("table"):
+            table_rows = table.find_all("tr", recursive=False)
+            if not table_rows:
+                body = table.find("tbody", recursive=False)
+                table_rows = body.find_all("tr", recursive=False) if body else []
+            headers = []
+            for row in table_rows:
+                cells = row.find_all(["td", "th"], recursive=False)
+                labels = [c.get_text(" ", strip=True) for c in cells]
+                if len(cells) >= 6 and not any(c.find("a", href=re.compile(r"details\.php")) for c in cells):
+                    if any("初始" in label or "今日达标" in label or "今日達標" in label for label in labels):
+                        headers = labels
+                        valid_table = True
+                if len(cells) < 6:
+                    continue
+                link = cells[1].find("a", href=re.compile(r"details\.php"))
+                if not link:
+                    continue
+                match = re.search(r"(?:[?&])id=(\d+)", html_module.unescape(link.get("href", "")))
+                if not match:
+                    continue
+                valid_table = True
+                item = {"torrent_id": match.group(1), "title": link.get_text(strip=True),
+                        "name": link.get_text(strip=True), "size_gb": round(parse_size_to_gb(labels[2]), 6),
+                        "init_seeders": safe_int(labels[3]), "curr_seeders": safe_int(labels[4]),
+                        "completed_time": labels[5], "remote_observed_at": observed}
+                aliases = {"last_settlement": ("上次结算", "上次結算"),
+                           "today_seeding": ("今日做种", "今日做種"),
+                           "today_qualified": ("今日是否达标", "今日是否達標", "今日达标", "今日達標")}
+                for fallback, (field, names) in enumerate(aliases.items(), 6):
+                    index = next((i for i, label in enumerate(headers) if any(n in label for n in names)), fallback)
+                    if index < len(cells):
+                        item[field] = labels[index]
+                raw_points = item.get("last_settlement", "")
+                if re.match(r"\d{4}-\d{2}-\d{2}", raw_points):
+                    item["last_settlement_time"] = raw_points
+                if re.fullmatch(r"[\d,.]+", raw_points):
+                    item["last_settlement_points"] = safe_float(raw_points.replace(",", ""))
+                rows.append(item)
+        if not valid_table:
+            raise RuntimeError(f"action=7 第 {page} 页未识别到档案表，保留原账本")
+        return rows, html
 
-    records = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for page_records in executor.map(fetch_page, range(25)):
-            records.extend(page_records)
-
-    elapsed = (datetime.now() - started).total_seconds()
-    print(f"      远端档案: {len(records)} 条，耗时 {elapsed:.1f}s")
-    return records
+    first, html = read_page(0)
+    matches = re.findall(r"\bmaxpage\s*[:=]\s*['\"]?(\d+)", html, re.I)
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("a", href=True):
+        if link.get("rel") == ["last"] or link.get_text(strip=True) in ("末页", "末頁", "Last", ">>"):
+            match = re.search(r"[?&]page=(\d+)", html_module.unescape(link["href"]))
+            if match:
+                matches.append(match.group(1))
+    for page_input in soup.select('input[type="number"][max]'):
+        count = safe_int(page_input.get("max"))
+        if count > 0:
+            matches.append(str(count-1))
+    last_page = max(map(int, matches)) if matches else None
+    records = {r["torrent_id"]: r for r in first}
+    data_pages = 1 if first else 0
+    page = 1
+    while last_page is None or page <= last_page:
+        rows, _ = read_page(page)
+        if not rows:
+            if last_page is not None:
+                raise RuntimeError(f"action=7 第 {page} 页意外为空，取消本次刷新")
+            break
+        fresh = {r["torrent_id"]: r for r in rows if r["torrent_id"] not in records}
+        if not fresh:
+            raise RuntimeError("action=7 返回重复页面，取消本次刷新，保留原账本")
+        records.update(fresh)
+        data_pages += 1
+        page += 1
+    print(f"      完整读取 {len(records)} 条 / {data_pages} 个数据页，耗时 {(datetime.now()-started).total_seconds():.1f}s")
+    return list(records.values())
 
 
 def merge_remote_into_cache(payload, remote_records):
@@ -450,86 +513,92 @@ def merge_remote_into_cache(payload, remote_records):
         payload["remote_updated_at"] = iso_now()
 
 
-def reconcile_cache_with_qb(payload, qb_torrents):
-    """Reconcile ledger with qB on every run.
-
-    A task manually moved from 待删除 back to 保种 becomes active on the next run
-    and therefore re-enters the global portfolio. Tasks that exist in qB but do
-    not have action=7 metadata remain unknown and are protected when
-    protect_unknown_records=true.
-    """
-    records = payload.setdefault("records", [])
+def reconcile_cache_with_qb(payload, qb_torrents, session=None):
+    records = deduplicate_records(payload.setdefault("records", []))
     now = iso_now()
-
     for record in records:
         record["present_in_qb"] = False
         record["active"] = False
-
-    hhan_count = 0
-    active_count = 0
-    restored_count = 0
-    unknown_count = 0
-
+    stats = {"hhan_in_qb": 0, "active_keep": 0, "restored": 0, "unknown": 0}
+    base = CONFIG["qb_base_url"].rstrip("/")
     for torrent in qb_torrents:
         if not is_hhan_torrent(torrent):
             continue
-        hhan_count += 1
-        title = torrent.get("name", "")
-        torrent_hash = torrent.get("hash", "")
-        size_gb = safe_float(torrent.get("size")) / (1024.0 ** 3)
-        category = torrent.get("category", "") or ""
-        record = find_cache_record(
-            records,
-            torrent_hash=torrent_hash,
-            title=title,
-            size_gb=size_gb,
-        )
+        stats["hhan_in_qb"] += 1
+        title, torrent_hash = torrent.get("name", ""), str(torrent.get("hash", "")).lower()
+        size_gb = torrent_size_gb(torrent)
+        record = find_cache_record(records, torrent_hash=torrent_hash, title=title, size_gb=size_gb)
         if record is None:
-            record = {
-                "hash": torrent_hash,
-                "title": title,
-                "name": title,
-                "size_gb": round(size_gb, 3),
-                "init_seeders": 0,
-                "curr_seeders": max(1, safe_int(torrent.get("num_complete"), 1)),
-                "age_weeks": 16.0,
-                "source": "qb_discovered",
-            }
+            record = {"hash": torrent_hash, "title": title, "init_seeders": 0, "source": "qb_discovered"}
             records.append(record)
-            unknown_count += 1
-
-        record["hash"] = torrent_hash
-        record["title"] = title
-        record["name"] = title
-        record["size_gb"] = round(size_gb, 3)
-        record["category"] = category
-        record["state"] = torrent.get("state", "")
-        record["progress"] = round(safe_float(torrent.get("progress")) * 100.0, 3)
-        record["present_in_qb"] = True
-        record["last_seen"] = now
-
-        qb_seeders = safe_int(torrent.get("num_complete"))
-        if qb_seeders > 0:
+        if (not record.get("torrent_id") or safe_int(record.get("init_seeders")) <= 0) and not record.get("identity_lookup_checked") and session is not None:
+            try:
+                response = session.get(f"{base}/api/v2/torrents/properties", params={"hash": torrent_hash}, timeout=20)
+                if response.status_code == 200:
+                    properties = response.json()
+                    if isinstance(properties, dict):
+                        torrent_id = torrent_id_from_comment(properties.get("comment", ""))
+                        record["identity_lookup_checked"] = True
+                        if torrent_id:
+                            record["torrent_id"] = torrent_id
+                            known = find_cache_record(records, torrent_id=torrent_id)
+                            if known is not None and known is not record:
+                                known["hash"] = torrent_hash
+                                # Force ID/hash union before applying fresh qB state.
+                                deduplicate_records(records)
+                                record = find_cache_record(records, torrent_hash=torrent_hash, torrent_id=torrent_id)
+            except (requests.RequestException, ValueError, TypeError):
+                pass  # Transient failures do not consume the one successful lookup.
+        previous_category = record.get("last_category", record.get("category"))
+        record.update({"hash": torrent_hash, "title": title, "name": title,
+                       "size_gb": round(size_gb, 6), "category": torrent.get("category", "") or "",
+                       "state": torrent.get("state", ""),
+                       "progress": round(safe_float(torrent.get("progress")) * 100.0, 6),
+                       "present_in_qb": True, "last_seen": now, "add_status": "confirmed"})
+        qb_seeders = safe_int(torrent.get("num_complete"), -1)
+        if qb_seeders >= 0:
             record["curr_seeders"] = qb_seeders
-
-        is_active = category == CONFIG["category_keep"]
-        record["active"] = is_active
-        if is_active:
-            active_count += 1
+        record["active"] = record["category"] == CONFIG["category_keep"]
+        if record["active"]:
+            stats["active_keep"] += 1
             record["last_active"] = now
-            if record.get("last_category") == CONFIG["category_del"]:
-                restored_count += 1
-        record["last_category"] = category
+            stats["restored"] += previous_category == CONFIG["category_del"]
+            stats["unknown"] += safe_int(record.get("init_seeders")) <= 0
+        record["last_category"] = record["category"]
         normalize_record_metrics(record)
-
+    for record in records:
+        if not record.get("present_in_qb") and record.get("add_status") in ("submitted", "uncertain"):
+            attempted = parse_iso(record.get("add_attempted_at"))
+            if attempted and (datetime.now()-attempted).total_seconds() >= safe_float(CONFIG.get("add_retry_seconds"), 600):
+                record["add_status"] = "failed"
+                record["add_attempted_at"] = now
+    deduplicate_records(records)
     payload["qb_reconciled_at"] = now
-    return {
-        "hhan_in_qb": hhan_count,
-        "active_keep": active_count,
-        "restored": restored_count,
-        "unknown": unknown_count,
-        "cache_records": len(records),
-    }
+    stats["cache_records"] = len(records)
+    return stats
+
+
+def torrent_size_gb(torrent):
+    return max(safe_float(torrent.get("total_size")), safe_float(torrent.get("size"))) / 1024.0 ** 3
+
+
+def torrent_is_complete(torrent):
+    state = str(torrent.get("state", "")).lower()
+    return (safe_float(torrent.get("progress")) >= 1.0 - 1e-9
+            and safe_int(torrent.get("amount_left"), 0) == 0
+            and state not in {"metadl", "downloading", "forceddl", "stalleddl", "queueddl", "pauseddl", "stoppeddl", "checkingdl", "checkingup", "checkingresumedata", "missingfiles", "error", "unknown"})
+
+
+def torrent_id_from_comment(comment):
+    allowed_host = urlparse(CONFIG["hhan_base_url"]).hostname
+    text = html_module.unescape(str(comment))
+    for url in re.findall(r"https?://[^\s<>\"']+", text):
+        parsed = urlparse(url.rstrip(").,;"))
+        if parsed.hostname == allowed_host and parsed.path.endswith("/details.php"):
+            values = parse_qs(parsed.query).get("id", [])
+            if values and values[0].isdigit():
+                return values[0]
+    return None
 
 
 def refresh_cache(session, force_remote=False, quiet=False):
@@ -543,7 +612,11 @@ def refresh_cache(session, force_remote=False, quiet=False):
     should_refresh_remote = remote_refresh_due(payload, force=(force_remote or cache_missing))
     remote_refreshed = False
     if should_refresh_remote:
-        remote_records = fetch_remote_preservation_records()
+        try:
+            remote_records = fetch_remote_preservation_records()
+        except RuntimeError as exc:
+            print(f"[缓存] {exc}")
+            remote_records = []
         if remote_records:
             merge_remote_into_cache(payload, remote_records)
             remote_refreshed = True
@@ -553,7 +626,7 @@ def refresh_cache(session, force_remote=False, quiet=False):
             print("[缓存] 强制远端刷新未取得记录，保留现有账本。")
 
     qb_torrents = qb_all_torrents(session)
-    stats = reconcile_cache_with_qb(payload, qb_torrents)
+    stats = reconcile_cache_with_qb(payload, qb_torrents, session=session)
     save_cache(payload)
     stats["cache_rebuilt"] = cache_missing
     stats["remote_refreshed"] = remote_refreshed
@@ -577,69 +650,51 @@ def refresh_cache(session, force_remote=False, quiet=False):
 # -----------------------------------------------------------------------------
 
 def check_qb_status(qb_torrents, cache_payload):
-    print("[1/4] 正在读取 qBittorrent 当前保种任务...")
+    global LAST_PORTFOLIO_CONTEXT
+    print("[1/4] 正在读取 qBittorrent 已完成保种任务...")
     existing_names = {normalize_name(t.get("name", "")) for t in qb_torrents}
-    keep = [
-        t for t in qb_torrents
-        if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]
-    ]
-    current_keep_gb = sum(safe_int(t.get("size")) for t in keep) / (1024.0 ** 3)
     records = cache_payload.get("records", [])
-
-    items = []
-    unmatched = 0
-    for torrent in keep:
-        size_gb = safe_float(torrent.get("size")) / (1024.0 ** 3)
-        record = find_cache_record(
-            records,
-            torrent_hash=torrent.get("hash"),
-            title=torrent.get("name", ""),
-            size_gb=size_gb,
-        )
+    keep = [t for t in qb_torrents if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]]
+    downloading = [t for t in keep if not torrent_is_complete(t)]
+    completed = [t for t in keep if torrent_is_complete(t)]
+    items, unmatched = [], 0
+    for torrent in completed:
+        size_gb = torrent_size_gb(torrent)
+        record = find_cache_record(records, torrent_hash=torrent.get("hash"), title=torrent.get("name"), size_gb=size_gb)
         init_n = safe_int(record.get("init_seeders")) if record else 0
-        curr_n = (
-            safe_int(record.get("curr_seeders"), 1)
-            if record else max(1, safe_int(torrent.get("num_complete"), 1))
-        )
-        age_weeks = safe_float(record.get("age_weeks"), 16.0) if record else 16.0
-
-        if init_n <= 0:
-            unmatched += 1
-        protected = False
-        protect_reason = ""
+        curr_n = safe_int(record.get("curr_seeders"), 1) if record else safe_int(torrent.get("num_complete"), 1)
+        age = age_weeks_from_time(record.get("published_time")) if record else None
+        unmatched += init_n <= 0
+        reason = ""
         if CONFIG.get("protect_init_one", True) and init_n == 1:
-            protected = True
-            protect_reason = "初始1人硬保护"
+            reason = "初始1人硬保护"
         elif CONFIG.get("protect_unknown_records", True) and init_n <= 0:
-            protected = True
-            protect_reason = "action=7元数据未知"
-
-        metrics = calc_preservation_metrics(size_gb, age_weeks, curr_n, init_n)
-        items.append({
-            "key": f"existing:{torrent['hash']}",
-            "source": "existing",
-            "hash": torrent["hash"],
-            "title": torrent.get("name", ""),
-            "name": torrent.get("name", ""),
-            "size_gb": size_gb,
-            "init_seeders": init_n,
-            "curr_seeders": curr_n,
-            "age_weeks": age_weeks,
-            "value_per_gb": metrics["value_per_gb"],
-            "portfolio_value": metrics["portfolio_value"],
-            "dpi": metrics["dpi"],
-            "protected": protected,
-            "protect_reason": protect_reason,
-        })
-
-    print(
-        f"      当前【{CONFIG['category_keep']}】专项配额占用: "
-        f"{current_keep_gb:.2f} GB / {safe_float(CONFIG['max_preservation_space_gb']):.2f} GB"
-    )
-    return existing_names, current_keep_gb, items, unmatched
+            reason = "action=7元数据未知"
+        metrics = calc_preservation_metrics(size_gb, age, curr_n, init_n)
+        items.append({"key": f"existing:{torrent['hash']}", "source": "existing",
+                      "hash": torrent["hash"], "title": torrent.get("name", ""), "name": torrent.get("name", ""),
+                      "size_gb": size_gb, "init_seeders": init_n, "curr_seeders": curr_n,
+                      "age_weeks": age, "protected": bool(reason), "protect_reason": reason, **metrics})
+    pending = [r for r in records if not r.get("present_in_qb") and r.get("add_status") in ("submitted", "uncertain")]
+    downloading_gb = sum(torrent_size_gb(t) for t in downloading) + sum(safe_float(r.get("size_gb")) for r in pending)
+    current_gb = sum(torrent_size_gb(t) for t in completed)
+    LAST_PORTFOLIO_CONTEXT = {"downloading_count": len(downloading)+len(pending),
+                              "downloading_gb": downloading_gb, "records": records,
+                              "strategy_state": cache_payload.setdefault("strategy_state", {})}
+    print(f"      已完成 {len(completed)} 个 / {current_gb:.2f} GB；下载/待确认 {len(downloading)+len(pending)} 个 / {downloading_gb:.2f} GB（收益评估排除）")
+    return existing_names, current_gb, items, unmatched
 
 
-def fetch_rescue_candidates(existing_names):
+def fetch_rescue_candidates(existing_names, existing_ids=None):
+    existing_ids = set(map(str, existing_ids or []))
+    for record in LAST_PORTFOLIO_CONTEXT.get("records", []):
+        if record.get("present_in_qb") or record.get("add_status") in ("submitted", "uncertain"):
+            if record.get("torrent_id"):
+                existing_ids.add(str(record["torrent_id"]))
+        elif record.get("add_status") == "failed":
+            last = parse_iso(record.get("add_attempted_at"))
+            if last and (datetime.now()-last).total_seconds() < safe_float(CONFIG.get("add_retry_seconds"), 600):
+                existing_ids.add(str(record.get("torrent_id", "")))
     print("[2/4] 正在扫描 HHanClub 保种区候选...")
     cards = []
     seen_ids = set()
@@ -680,6 +735,7 @@ def fetch_rescue_candidates(existing_names):
     candidates = []
     now = datetime.now()
 
+    processed_ids = set()
     for card in cards:
         link = card.find("a", class_=re.compile(r"torrent-info-text-name"))
         if not link:
@@ -689,6 +745,12 @@ def fetch_rescue_candidates(existing_names):
         if not m:
             continue
         torrent_id = m.group(1)
+        if torrent_id in processed_ids:
+            continue
+        processed_ids.add(torrent_id)
+        if torrent_id in existing_ids:
+            stats["already_have"] += 1
+            continue
         size_div = card.find("div", class_=re.compile(r"torrent-info-text-size"))
         size_gb = parse_size_to_gb(size_div.get_text(strip=True) if size_div else "")
         seed_div = card.find("div", class_=re.compile(r"torrent-info-text-seeders"))
@@ -697,13 +759,7 @@ def fetch_rescue_candidates(existing_names):
         added_div = card.find("div", class_=re.compile(r"torrent-info-text-added"))
         span = added_div.find("span") if added_div else None
         added_text = span.get("title", "") if span else ""
-        age_weeks = 16.0
-        if added_text:
-            try:
-                dt = datetime.strptime(added_text.strip(), "%Y-%m-%d %H:%M:%S")
-                age_weeks = max(0.1, (now - dt).total_seconds() / 604800.0)
-            except ValueError:
-                pass
+        age_weeks = age_weeks_from_time(added_text)
 
         normalized = normalize_name(title)
         if normalized in existing_names or any(
@@ -729,7 +785,8 @@ def fetch_rescue_candidates(existing_names):
             "title": title,
             "size_gb": round(size_gb, 3),
             "seeders": seeders,
-            "age_weeks": round(age_weeks, 3),
+            "age_weeks": round(age_weeks, 6) if age_weeks is not None else None,
+            "published_time": added_text or None,
             "value_per_gb": round(metrics["value_per_gb"], 6),
             "portfolio_value": round(metrics["portfolio_value"], 6),
         })
@@ -746,7 +803,8 @@ def fetch_rescue_candidates(existing_names):
 # Portfolio optimizer
 # -----------------------------------------------------------------------------
 
-def knapsack_select(items, capacity_gb, unit_gb):
+
+def knapsack_select(items, capacity_gb, unit_gb, target_value=None):
     if not items or capacity_gb <= 0:
         return []
     unit_gb = max(0.05, safe_float(unit_gb, 0.1))
@@ -786,7 +844,12 @@ def knapsack_select(items, capacity_gb, unit_gb):
                 row[cap] = 1
         decisions.append(row)
 
-    cap = max(range(capacity + 1), key=lambda c: dp[c])
+    if target_value is not None:
+        cap = next((c for c, value in enumerate(dp) if value + 1e-9 >= target_value), None)
+        if cap is None:
+            return []
+    else:
+        cap = max(range(capacity + 1), key=lambda c: dp[c])
     selected = []
     for idx in range(len(filtered) - 1, -1, -1):
         if decisions[idx][cap]:
@@ -964,33 +1027,113 @@ def print_strategy_report(
 
 def upsert_candidate_cache(candidate):
     payload = load_cache()
-    records = payload.setdefault("records", [])
-    record = find_cache_record(
-        records,
-        torrent_id=candidate["id"],
-        title=candidate["title"],
-        size_gb=candidate["size_gb"],
-    )
-    if record is None:
-        record = {}
-        records.append(record)
-    record.update({
-        "torrent_id": str(candidate["id"]),
-        "title": candidate["title"],
-        "name": candidate["title"],
-        "size_gb": candidate["size_gb"],
-        "init_seeders": candidate["seeders"],
-        "curr_seeders": candidate["seeders"],
-        "age_weeks": candidate.get("age_weeks", 0.1),
-        "completed_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "source": "download_candidate",
-        "active": True,
-        "category": CONFIG["category_keep"],
-        "last_active": iso_now(),
-        "last_seen": iso_now(),
-    })
-    normalize_record_metrics(record)
+    record = merge_record(payload.setdefault("records", []), {
+        "torrent_id": str(candidate["id"]), "hash": candidate.get("hash"),
+        "hash_v1": candidate.get("hash_v1"), "hash_v2": candidate.get("hash_v2"),
+        "title": candidate["title"], "name": candidate["title"], "size_gb": candidate["size_gb"],
+        "init_seeders": candidate["seeders"], "curr_seeders": candidate["seeders"],
+        "published_time": candidate.get("published_time")}, "download_candidate")
+    record.update({"add_status": candidate.get("add_status", "submitted"),
+                   "add_attempted_at": iso_now(), "category": CONFIG["category_keep"],
+                   "active": False, "identity_lookup_checked": True})
     save_cache(payload)
+
+
+def torrent_metadata(data):
+    """Hash the original bencoded info slice; support v1, v2 and hybrid torrents."""
+    if not isinstance(data, bytes):
+        raise ValueError("torrent is not bytes")
+    position, info_range = 0, None
+    def decode(depth=0):
+        nonlocal position, info_range
+        if depth > 100 or position >= len(data):
+            raise ValueError("invalid bencode")
+        token = data[position:position+1]
+        if token == b"i":
+            end = data.find(b"e", position)
+            raw = data[position+1:end]
+            if end < 0 or not re.fullmatch(rb"-?(0|[1-9]\d*)", raw) or raw == b"-0":
+                raise ValueError("invalid integer")
+            position = end+1
+            return int(raw)
+        if token in (b"d", b"l"):
+            position += 1
+            result = {} if token == b"d" else []
+            while position < len(data) and data[position:position+1] != b"e":
+                if token == b"d":
+                    key = decode(depth+1)
+                    if not isinstance(key, bytes) or key in result:
+                        raise ValueError("invalid dictionary")
+                    start = position
+                    result[key] = decode(depth+1)
+                    if depth == 0 and key == b"info":
+                        info_range = (start, position)
+                else:
+                    result.append(decode(depth+1))
+            if position >= len(data):
+                raise ValueError("unterminated bencode")
+            position += 1
+            return result
+        end = data.find(b":", position)
+        raw_length = data[position:end]
+        if end < 0 or not re.fullmatch(rb"0|[1-9]\d*", raw_length):
+            raise ValueError("invalid string")
+        length = int(raw_length)
+        position = end+1
+        if position+length > len(data):
+            raise ValueError("truncated string")
+        result = data[position:position+length]
+        position += length
+        return result
+    meta = decode()
+    if position != len(data) or not isinstance(meta, dict) or info_range is None:
+        raise ValueError("not a torrent")
+    info = meta.get(b"info")
+    if not isinstance(info, dict):
+        raise ValueError("missing info dictionary")
+    raw_info = data[slice(*info_range)]
+    v2 = info.get(b"meta version") == 2
+    v1 = not v2 or b"pieces" in info
+    hash_v1 = hashlib.sha1(raw_info).hexdigest() if v1 else ""
+    hash_v2 = hashlib.sha256(raw_info).hexdigest() if v2 else ""
+    def tree_size(node):
+        if not isinstance(node, dict):
+            raise ValueError("invalid file tree")
+        total = 0
+        for key, value in node.items():
+            if key == b"":
+                if not isinstance(value, dict) or not isinstance(value.get(b"length"), int):
+                    raise ValueError("invalid file length")
+                total += value[b"length"]
+            else:
+                total += tree_size(value)
+        return total
+    if b"files" in info:
+        lengths = [f.get(b"length") for f in info[b"files"]]
+        if not lengths or any(not isinstance(n, int) or n < 0 for n in lengths):
+            raise ValueError("invalid file lengths")
+        size = sum(lengths)
+    elif isinstance(info.get(b"length"), int):
+        size = info[b"length"]
+    elif v2:
+        size = tree_size(info.get(b"file tree"))
+    else:
+        raise ValueError("missing size")
+    if size <= 0:
+        raise ValueError("empty torrent")
+    return {"hash": hash_v1 or hash_v2[:40], "hash_v1": hash_v1, "hash_v2": hash_v2,
+            "size_gb": size / 1024.0 ** 3}
+
+
+def qb_find_hash(session, metadata):
+    base = CONFIG["qb_base_url"].rstrip("/")
+    response = session.get(f"{base}/api/v2/torrents/info", params={"hashes": metadata["hash"]}, timeout=20)
+    response.raise_for_status()
+    values = response.json()
+    if not isinstance(values, list):
+        raise ValueError("invalid torrent list")
+    hashes = {metadata.get("hash"), metadata.get("hash_v1"), metadata.get("hash_v2"), str(metadata.get("hash_v2", ""))[:40]} - {"", None}
+    return next((item for item in values if str(item.get("hash", "")).lower() in hashes), None)
 
 
 def current_keep_gb(session):
@@ -1003,83 +1146,176 @@ def current_keep_gb(session):
 
 
 def execute_actions(session, to_download, to_mark_delete):
-    print("[4/4] 正在执行本轮操作...")
+    print("[4/4] 执行 V6 操作（下载完成前不以新种收益清退老种）...")
     base = CONFIG["qb_base_url"].rstrip("/")
-    added = 0
-
-    for candidate in to_download:
-        torrent_bytes = curl_download_torrent(candidate["id"])
-        if not torrent_bytes or len(torrent_bytes) < 100:
-            print(f"      ❌ #{candidate['id']} 种子文件下载失败")
-            continue
-        files = {
-            "torrents": (
-                f"{candidate['id']}.torrent",
-                torrent_bytes,
-                "application/x-bittorrent",
-            )
-        }
-        data = {
-            "category": CONFIG["category_keep"],
-            "autoTMM": "true",
-            "paused": "false",
-        }
-        response = session.post(
-            f"{base}/api/v2/torrents/add", files=files, data=data, timeout=30
-        )
-        if response.status_code == 200 and "fails" not in response.text.lower():
-            added += 1
-            upsert_candidate_cache(candidate)
-            print(f"      ✅ 已加入 #{candidate['id']} {candidate['title'][:55]}")
-        else:
-            print(
-                f"      ❌ #{candidate['id']} 加入 qB 失败: "
-                f"HTTP {response.status_code} {response.text.strip()}"
-            )
-        time.sleep(0.5)
-
-    marked = 0
-    if to_mark_delete:
+    # One fresh PRE-add snapshot; no dependence on immediate post-add visibility.
+    before = qb_all_torrents(session)
+    keep = [t for t in before if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]]
+    completed = {str(t["hash"]).lower(): t for t in keep if torrent_is_complete(t)}
+    downloading_gb = sum(torrent_size_gb(t) for t in keep if not torrent_is_complete(t))
+    pending = [r for r in load_cache().get("records", []) if not r.get("present_in_qb") and r.get("add_status") in ("submitted", "uncertain")]
+    visible = {str(t.get("hash", "")).lower() for t in before}
+    downloading_gb += sum(safe_float(r.get("size_gb")) for r in pending if str(r.get("hash", "")).lower() not in visible)
+    buffer_limit = max(0.0, safe_float(CONFIG.get("max_downloading_space_gb"), 250))
+    quota = safe_float(CONFIG["max_preservation_space_gb"])
+    payload = load_cache()
+    added, known_added_gb = 0, 0.0
+    # Do not execute a stale deletion plan after a concurrent manual/category change.
+    expected = set(LAST_STRATEGY_CONTEXT.get("completed_hashes", completed))
+    if set(completed) != expected:
+        print("      当前已完成组合已变化，本轮取消操作；下一轮重新计算。")
+        return
+    payload["strategy_state"] = dict(LAST_STRATEGY_CONTEXT.get("strategy_state", payload.get("strategy_state", {})))
+    save_cache(payload)
+    completed_gb = sum(torrent_size_gb(t) for t in completed.values())
+    batch_count = max(0, safe_int(CONFIG.get("max_batch_download_count"), 10))
+    for candidate in to_download[:batch_count]:
         try:
-            required_free = max(
-                0.0,
-                current_keep_gb(session) - safe_float(CONFIG["max_preservation_space_gb"]),
-            )
-        except Exception as exc:
-            print(f"      ⚠️ 无法复核 qB 配额，跳过退出旧任务: {exc}")
-            required_free = 0.0
-
-        selected, selected_gb = [], 0.0
-        for item in to_mark_delete:
-            if selected_gb + 1e-9 >= required_free:
-                break
-            selected.append(item)
-            selected_gb += safe_float(item["size_gb"])
-
-        if selected:
-            hashes = "|".join(item["hash"] for item in selected)
-            response = session.post(
-                f"{base}/api/v2/torrents/setCategory",
-                data={"hashes": hashes, "category": CONFIG["category_del"]},
-                timeout=20,
-            )
-            if response.status_code == 200:
-                marked = len(selected)
-                print(
-                    f"      ✅ {marked} 个旧任务转为【{CONFIG['category_del']}】，"
-                    f"退出专项配额约 {selected_gb:.2f} GB"
-                )
+            torrent_bytes = curl_download_torrent(candidate["id"])
+            metadata = torrent_metadata(torrent_bytes)
+        except (ValueError, TypeError, KeyError):
+            print(f"      #{candidate['id']} 种子数据无效，未提交")
+            continue
+        item = dict(candidate, **metadata)
+        if metadata["hash"] in visible:
+            item["add_status"] = "existing"
+            upsert_candidate_cache(item)
+            print(f"      #{candidate['id']} hash 已存在，已合并身份")
+            continue
+        if metadata["size_gb"] > safe_float(CONFIG["max_single_download_gb"]) + 1e-9:
+            print(f"      #{candidate['id']} 实际大小超过单种上限，跳过")
+            continue
+        if known_added_gb + metadata["size_gb"] > safe_float(CONFIG["max_batch_download_gb"]) + 1e-9:
+            print(f"      #{candidate['id']} 实际大小超过本轮新增上限，跳过")
+            continue
+        if downloading_gb + known_added_gb + metadata["size_gb"] > buffer_limit + 1e-9:
+            print(f"      #{candidate['id']} 实际大小超过剩余下载缓冲，跳过")
+            continue
+        if LAST_STRATEGY_CONTEXT.get("strategy_mode") == "GROW" and completed_gb + downloading_gb + known_added_gb + metadata["size_gb"] > quota + 1e-9:
+            print(f"      #{candidate['id']} 实际大小超过建仓剩余配额（含已有下载预留），跳过")
+            continue
+        # Persist the identity before submitting, so interrupted/ambiguous requests cannot churn.
+        item["add_status"] = "uncertain"
+        upsert_candidate_cache(item)
+        try:
+            response = session.post(f"{base}/api/v2/torrents/add",
+                files={"torrents": (f"{candidate['id']}.torrent", torrent_bytes, "application/x-bittorrent")},
+                data={"category": CONFIG["category_keep"], "autoTMM": "true", "paused": "false"}, timeout=30)
+            success = response.status_code == 200 and response.text.strip().lower() == "ok."
+            if not success:
+                try:
+                    result = response.json()
+                    success = response.status_code == 200 and isinstance(result, dict) and safe_int(result.get("success_count")) + safe_int(result.get("pending_count")) > 0
+                except ValueError:
+                    pass
+            if success:
+                item["add_status"] = "submitted"
+                added += 1
+                known_added_gb += metadata["size_gb"]
+                visible.add(metadata["hash"])
             else:
-                print(f"      ❌ 分类变更失败: HTTP {response.status_code}")
+                existing = qb_find_hash(session, metadata)
+                item["add_status"] = "existing" if existing else "failed"
+                if existing:
+                    # This hash was absent from the pre-add snapshot; reserve it
+                    # conservatively for the remainder of this batch as well.
+                    known_added_gb += metadata["size_gb"]
+                    visible.add(metadata["hash"])
+                print(f"      #{candidate['id']} {'已存在并合并' if existing else '未确认加入，进入重试冷却'}（HTTP {response.status_code}）")
+        except (requests.RequestException, ValueError):
+            item["add_status"] = "uncertain"
+            known_added_gb += metadata["size_gb"]
+            print(f"      #{candidate['id']} 提交结果待确认，预留空间并暂停重复提交")
+        upsert_candidate_cache(item)
+    if to_mark_delete:
+        # Fetch again after potentially slow torrent downloads / add requests.
+        # A manual category/progress change invalidates the old deletion plan.
+        latest = qb_all_torrents(session)
+        completed = {str(t["hash"]).lower(): t for t in latest
+                     if is_hhan_torrent(t) and t.get("category") == CONFIG["category_keep"]
+                     and torrent_is_complete(t)}
+        if set(completed) != expected:
+            print("      提交期间已完成组合已变化，取消清退；下一轮重新计算。")
+            return
+        payload = load_cache()
+    selected = []
+    floor = safe_float(LAST_STRATEGY_CONTEXT.get("value_floor"))
+    actual_values = {}
+    for h, torrent in completed.items():
+        record = find_cache_record(payload.get("records", []), torrent_hash=h) or {}
+        curr = safe_int(torrent.get("num_complete"), -1)
+        if curr < 0:
+            curr = safe_int(record.get("curr_seeders"), 1)
+        actual_values[h] = calc_preservation_metrics(torrent_size_gb(torrent),
+            age_weeks_from_time(record.get("published_time")), curr, record.get("init_seeders"))["portfolio_value"]
+    remaining_value = sum(actual_values.values())
+    for item in to_mark_delete:
+        h = str(item["hash"]).lower()
+        if h not in completed:
+            continue
+        record = find_cache_record(payload.get("records", []), torrent_hash=h) or {}
+        init_n = safe_int(record.get("init_seeders"))
+        if (CONFIG.get("protect_init_one", True) and init_n == 1) or (CONFIG.get("protect_unknown_records", True) and init_n <= 0):
+            print("      实时元数据属于硬保护项，跳过清退")
+            continue
+        if item.get("reason") != "OVERQUOTA" and remaining_value - actual_values[h] < floor - 1e-6:
+            print("      实时收益约束不满足，停止空间清退")
+            break
+        selected.append(item)
+        remaining_value -= actual_values[h]
+    marked = 0
+    if selected:
+        response = session.post(f"{base}/api/v2/torrents/setCategory",
+            data={"hashes": "|".join(x["hash"] for x in selected), "category": CONFIG["category_del"]}, timeout=20)
+        if response.status_code != 200:
+            raise RuntimeError(f"qB 分类变更失败，HTTP {response.status_code}；账本未标为已清退")
+        if response.status_code == 200:
+            marked = len(selected)
+            updated = load_cache()
+            for selected_item in selected:
+                record = find_cache_record(updated.get("records", []), torrent_hash=selected_item["hash"])
+                if record is not None:
+                    record.update({"active": False, "category": CONFIG["category_del"], "last_category": CONFIG["category_del"]})
+            save_cache(updated)
+            print(f"      {marked} 个已完成任务转为【{CONFIG['category_del']}】，分类配额释放 {sum(safe_float(x['size_gb']) for x in selected):.2f} GB；文件清理由用户处理")
+    print(f"执行完成：新增 {added} 个 / 已知预留 {known_added_gb:.2f} GB，转分类 {marked} 个。")
 
-    try:
-        refresh_cache(session, force_remote=False, quiet=True)
-    except Exception as exc:
-        print(f"      ⚠️ 执行后缓存对账失败: {exc}")
-    print(f"执行完成：新增 {added} 个，转为【{CONFIG['category_del']}】 {marked} 个。")
+
+def apply_config_overrides(overrides, parser):
+    for override in overrides:
+        if "=" not in override:
+            parser.error("--set 必须为 KEY=VALUE")
+        key, raw = override.split("=", 1)
+        if key not in CONFIG:
+            parser.error(f"未知配置项: {key}")
+        old = CONFIG[key]
+        try:
+            if isinstance(old, bool):
+                if raw.lower() not in ("true", "false"):
+                    raise ValueError()
+                value = raw.lower() == "true"
+            elif isinstance(old, int):
+                value = int(raw)
+            elif isinstance(old, float):
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError()
+            else:
+                value = raw
+        except ValueError:
+            parser.error(f"配置项 {key} 的类型不正确")
+        CONFIG[key] = value
+    for key in ("max_preservation_space_gb", "max_downloading_space_gb", "max_batch_download_gb", "max_batch_download_count", "space_reward_reference_value", "space_min_saving_gb"):
+        if safe_float(CONFIG.get(key)) < 0:
+            parser.error(f"配置项 {key} 不能为负数")
+    if not 0 <= safe_float(CONFIG.get("space_reward_loss_ratio")) < 1:
+        parser.error("space_reward_loss_ratio 必须在 [0, 1) 内")
+    if not 0 < safe_float(CONFIG.get("space_optimization_start_ratio")) <= 1:
+        parser.error("space_optimization_start_ratio 必须在 (0, 1] 内")
 
 
 def main():
+    global CACHE_READ_ONLY, LAST_STRATEGY_CONTEXT
     parser = argparse.ArgumentParser(description="HHanClub 保种区自动化综合管理")
     parser.add_argument(
         "--execute", action="store_true", help="实际执行下载和分类变更；默认仅 dry-run"
@@ -1092,9 +1328,15 @@ def main():
     parser.add_argument(
         "--sync", action="store_true", help="兼容旧参数：等同 --refresh-cache"
     )
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="dry-run 临时配置覆盖，可重复；不修改配置或账本")
     args = parser.parse_args()
+    if args.set and (args.execute or args.refresh_cache or args.sync):
+        parser.error("--set 仅用于 dry-run，不能与 --execute/--refresh-cache/--sync 组合")
 
     load_config()
+    apply_config_overrides(args.set, parser)
+    CACHE_READ_ONLY = not (args.execute or args.refresh_cache or args.sync)
+    LAST_STRATEGY_CONTEXT = {}
     session = get_qb_session()
 
     cache_only = bool(args.refresh_cache or args.sync)
@@ -1143,4 +1385,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from hhan_pzone_manager import core as entry_core
+    entry_core.main()

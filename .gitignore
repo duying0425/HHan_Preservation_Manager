@@ -21,3 +21,5 @@ ENV/
 .vscode/
 .DS_Store
 Thumbs.db
+PAUSE
+STOP

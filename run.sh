@@ -4,6 +4,16 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/manager.log"
+
+if [ -f "$SCRIPT_DIR/PAUSE" ] || [ -f "$SCRIPT_DIR/STOP" ]; then
+    TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$TIMESTAMP] 定时任务已暂停 (检测到 PAUSE/STOP 标记，跳过本次执行)" >> "$LOG_FILE"
+    exit 0
+fi
+
 PYTHON_BIN="/usr/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
     PYTHON_BIN="$(command -v python3 || command -v python || true)"
@@ -13,10 +23,6 @@ if [ -z "$PYTHON_BIN" ]; then
     echo "Python 3 not found" >&2
     exit 127
 fi
-
-LOG_DIR="$SCRIPT_DIR/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/manager.log"
 
 if [ "$#" -eq 0 ]; then
     set -- --execute
@@ -40,4 +46,4 @@ END_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
     echo ""
 } >> "$LOG_FILE"
 
-exit $EXIT_CODE
+exit "$EXIT_CODE"

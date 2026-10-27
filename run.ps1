@@ -13,6 +13,11 @@ if (-not (Test-Path -LiteralPath $ManagerScript)) {
     exit 2
 }
 
+if ((Test-Path (Join-Path $ScriptDir 'PAUSE')) -or (Test-Path (Join-Path $ScriptDir 'STOP'))) {
+    Write-Host '[PAUSED] Detected PAUSE/STOP file. Scheduled run skipped.'
+    exit 0
+}
+
 function Test-Python3 {
     param([string]$Exe, [string[]]$Prefix = @())
     try {
