@@ -5,6 +5,7 @@
 Portfolio selection uses the V6 score and quota rules. Daily point forecasts
 reuse the V5 observation-based algorithm without an 18-hour qualification gate.
 """
+from collections import Counter
 import re
 import hhan_pzone_core as core
 
@@ -368,7 +369,10 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb,
     print(f"已完成配额 {current_keep_gb:.2f} -> {current_keep_gb-marked_gb:.2f} / {core.CONFIG['max_preservation_space_gb']:.2f} GB")
     print(f"下载预留 {stats['downloading_gb']:.2f} + {download_gb:.2f} / {core.CONFIG['max_downloading_space_gb']:.2f} GB（完整大小；不计收益）")
     print(f"代理值 {stats['current_value']:.2f} -> {stats['planned_value']:.2f}；固定参考基准 {stats['reference_value']:.2f}；下限 {stats['value_floor']:.2f}")
-    print(f"硬保护 {stats['protected_count']} 个 / {stats['protected_gb']:.2f} GB；元数据未知 {unmatched_count} 个")
+    print(f"硬保护（禁止自动清退）{stats['protected_count']} 个 / {stats['protected_gb']:.2f} GB；元数据未知 {unmatched_count} 个")
+    protection_reasons = Counter(item['protect_reason'] for item in stats['completed_items'] if item.get('protected'))
+    if protection_reasons:
+        print("保护原因：" + "；".join(f"{reason} {count} 个" for reason, count in protection_reasons.items()))
     points = stats['site_points']
     print(f"站点最近保种结算：{points.get('rescue_day')}（V5 预测输入）")
     if points.get('base_day') is not None:
@@ -385,15 +389,16 @@ def print_strategy_report(to_download, download_gb, to_mark_delete, marked_gb,
     if stats['suppression_reason']:
         print(f"判断说明：{stats['suppression_reason']}")
     print(f"候选 {zone_stats['eligible_count']} 个；已有/重复过滤 {zone_stats['already_have']} 个")
-    deleted_hashes = {x['hash'] for x in to_mark_delete}
-    print("\n已完成任务（档位由 init 确定）：")
-    for item in stats['completed_items']:
-        action = '待清退' if item['hash'] in deleted_hashes else '保留'
-        print(f"  {action} | 档位 {tier_label(item['init_seeders'])} | {item['size_gb']:.2f} GB | init={item['init_seeders']} curr={item['curr_seeders']} | 代理 {item['portfolio_value']:.2f} | {item['name']}" + (f" | {item['protect_reason']}" if item.get('protected') else ''))
+    completed_count = len(stats['completed_items'])
+    tier_counts = Counter(tier_label(item['init_seeders']) for item in stats['completed_items'])
+    print(f"\n已完成任务汇总：共 {completed_count} 个；保留 {completed_count-len(to_mark_delete)} 个；本轮转分类 {len(to_mark_delete)} 个")
+    print("档位汇总（按 init）：" + "；".join(f"{label} {tier_counts[label]} 个" for label in ("1人", "2–3人", "4–5人", "未知/其他")))
     print(f"\n新增 {len(to_download)} 个 / {download_gb:.2f} GB：")
     for item in to_download:
         print(f"  #{item['id']} | 档位 {tier_label(item['seeders'])}（下载时估计，远端档案校正） | {item['size_gb']:.2f} GB | {item['title']}")
     print(f"转为【{core.CONFIG['category_del']}】{len(to_mark_delete)} 个 / {marked_gb:.2f} GB；分类变更不会立即释放磁盘空间。")
+    for item in to_mark_delete:
+        print(f"  转分类 | 档位 {tier_label(item['init_seeders'])} | {item['size_gb']:.2f} GB | init={item['init_seeders']} curr={item['curr_seeders']} | 代理 {item['portfolio_value']:.2f} | {item['name']}")
     if stats['unresolved_overflow_gb'] > 1e-6:
         print(f"仍超配额 {stats['unresolved_overflow_gb']:.2f} GB：受硬保护限制，需人工处理。")
     print("10% 默认降幅约束比较模型；不保证站点实际积分同比例变化。下载中异常任务由用户处理。")
